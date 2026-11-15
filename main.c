@@ -29,6 +29,7 @@ typedef struct { Vector2 p, t, r; } TP;  // centre, tangent, right-hand normal (
 static TP trk[NSEG];
 static float trkLen;
 static float trkY[NSEG];      // road elevation (flyovers)
+static float trkK[NSEG];      // road curvature (1/radius) at each point
 static Vector2 crossP;        // centre of the flyover crossing
 static bool hasBridge;
 static int bridgeLo = -1, bridgeHi = -1;   // track indices of the lower and upper pass at the flyover
@@ -43,6 +44,14 @@ typedef struct { float thr, steer; bool hb, fire[NW]; } Ctl;
 
 typedef struct { int armor, fspike, rspike, gun, missile, laser, ammo, engine, trans, tires; } Upg;
 typedef struct { float x, y, z, dx, dz, r, depth; } Dent;
+typedef struct { const char *name, *desc; float spd, acc, grip, hp, mass, sx, sy, sz; } CarType;
+static const CarType ctypes[3] = {
+    {"BRAWLER", "Balanced all-rounder. No weaknesses, no tricks.", 1.00f, 1.00f, 1.00f, 100, 1.00f, 1.00f, 1.00f, 1.00f},
+    {"HORNET", "Light and nimble: quicker, grippier, but fragile and easily shoved around.", 1.06f, 1.12f, 1.10f, 80, 0.80f, 0.94f, 0.88f, 1.04f},
+    {"CRUSHER", "Heavy armored bruiser: very tough and wins collisions, but slower.", 0.94f, 0.88f, 0.94f, 135, 1.45f, 1.12f, 1.18f, 0.97f},
+};
+static const Color carPalette[8] = {{40,120,255,255},{230,50,50,255},{235,200,40,255},{40,200,120,255},{255,130,20,255},{160,70,210,255},{235,235,235,255},{70,70,80,255}};
+static int carType, carColor;   // the player's choice (saved with the campaign)
 #define NDENT 24
 // deformable body lattice: top 9x17, sides 17x4 (x2), ends 9x4 (x2)
 #define NV 361
@@ -53,6 +62,7 @@ typedef struct {
     int ammo[NW];
     float cd[NW];
     int lap, idx, kills, lastAttacker, place;
+    float mass; int type; float finT, aiBurst, aiRest; bool gone;
     float prog, respawn, invuln, flat, stuck, finishTime, aiT, maxhp, y, accel, gripN, steerK, accFall, battery, evadeT, prevSteerIn, prevThr;
     bool ai, alive, finished, meshDirty;
     Upg u;
@@ -80,7 +90,7 @@ static int partHead;
 typedef struct { Vector3 p; float h, w, d; Color c; int type; } Deco;
 static Deco deco[220];
 
-typedef enum { ST_MENU, ST_STORE, ST_COUNT, ST_RACE, ST_DONE, ST_END } State;
+typedef enum { ST_MENU, ST_STORE, ST_COUNT, ST_RACE, ST_DONE, ST_END, ST_CARSEL } State;
 static State state = ST_MENU;
 static float stateT, raceT, shake;
 static char msgs[5][64];
@@ -124,6 +134,94 @@ static void snd(Sound s, float vol, float pitch) {
     SetSoundVolume(s, vol);
     SetSoundPitch(s, pitch);
     PlaySound(s);
+}
+
+
+// ---------------------------------------------------------------- title music (synthesized at startup, no assets)
+// 8 bars of A minor at 112 BPM: pad, bass, arpeggio with echo, lead melody and drums, rendered to a 22 kHz loop.
+#define MUS_SR 22050
+static Music titleMusic;
+static bool musicOK;
+static float musicVol;
+static unsigned char *musicWav;
+static int musicWavSize;
+static float mNoise(void) { static unsigned st = 12345; st = st * 1664525u + 1013904223u; return ((st >> 8) & 0xFFFF) / 32768.0f - 1.0f; }
+static float midiHz(float n) { return 440.0f * powf(2.0f, (n - 69.0f) / 12.0f); }
+static void mNote(float *mix, int N, float t0, float dur, float hz, float vol, int wave, float decay) {   // wave: 0 square, 1 saw, 2 sine
+    int s0 = (int)(t0 * MUS_SR), n = (int)(dur * MUS_SR);
+    for (int i = 0; i < n; i++) {
+        float t = (float)i / MUS_SR, ph = hz * t; ph -= floorf(ph);
+        float w = wave == 0 ? (ph < 0.4f ? 1.0f : -1.0f) : wave == 1 ? 2 * ph - 1 : sinf(6.2831853f * ph);
+        float env = expf(-decay * t) * fminf(1, t / 0.005f) * (i > n - 300 ? (float)(n - i) / 300 : 1);
+        mix[(s0 + i) % N] += w * env * vol;   // modulo: the tail wraps around so the loop is seamless
+    }
+}
+static void mKick(float *mix, int N, float t0, float vol) {
+    int s0 = (int)(t0 * MUS_SR), n = (int)(0.28f * MUS_SR); float ph = 0;
+    for (int i = 0; i < n; i++) {
+        float t = (float)i / MUS_SR, f = 45 + 95 * expf(-22 * t);
+        ph += f / MUS_SR;
+        mix[(s0 + i) % N] += sinf(6.2831853f * ph) * expf(-9 * t) * vol;
+    }
+}
+static void mSnare(float *mix, int N, float t0, float vol) {
+    int s0 = (int)(t0 * MUS_SR), n = (int)(0.22f * MUS_SR);
+    for (int i = 0; i < n; i++) {
+        float t = (float)i / MUS_SR;
+        mix[(s0 + i) % N] += (mNoise() * expf(-17 * t) * 0.6f + sinf(6.2831853f * 190 * t) * expf(-26 * t) * 0.4f) * vol;
+    }
+}
+static void mHat(float *mix, int N, float t0, float vol, float decay) {
+    int s0 = (int)(t0 * MUS_SR), n = (int)(0.09f * MUS_SR); float prev = 0;
+    for (int i = 0; i < n; i++) {
+        float t = (float)i / MUS_SR, x = mNoise();
+        mix[(s0 + i) % N] += (x - prev) * 0.5f * expf(-decay * t) * vol;   // differencing = crude high-pass
+        prev = x;
+    }
+}
+static void buildTitleMusic(void) {
+    const float beat = 60.0f / 112.0f, step = beat / 4;
+    const int bars = 8, steps = bars * 16, N = (int)(steps * step * MUS_SR);
+    float *mix = calloc(N, sizeof(float));
+    static const int bassRoot[8] = {33, 33, 29, 31, 33, 33, 29, 28};                       // A A F G A A F E
+    static const int tri[8][3] = {{69,72,76},{69,72,76},{65,69,72},{67,71,74},{69,72,76},{69,72,76},{65,69,72},{64,68,71}};
+    static const int arpPat[16] = {0,1,2,1, 0,1,2,1, 0,1,2,1, 2,1,2,1};
+    static const int lead[4][8] = {{69,0,72,0,76,0,74,72},{69,0,72,76,81,0,79,76},{69,0,72,0,77,0,76,72},{68,71,76,0,74,71,68,0}};
+    for (int bar = 0; bar < bars; bar++) {
+        float tb = bar * 16 * step;
+        for (int k = 0; k < 3; k++) mNote(mix, N, tb, 16 * step, midiHz(tri[bar][k] - 12), 0.045f, 2, 0.25f);   // pad
+        for (int st = 0; st < 16; st++) {
+            float t = tb + st * step;
+            if (st % 2 == 0) {   // bass on eighths
+                int e = st / 2, n = bassRoot[bar] + ((e == 2 || e == 5) ? 12 : (e == 7 ? 7 : 0));
+                mNote(mix, N, t, 2 * step * 0.9f, midiHz((float)n), 0.30f, 1, 3.5f);
+            }
+            int an = tri[bar][arpPat[st] % 3] + (st >= 12 ? 12 : 0);      // arpeggio + echo
+            mNote(mix, N, t, step * 1.5f, midiHz((float)an), 0.075f, 0, 7);
+            mNote(mix, N, t + 3 * step, step * 1.5f, midiHz((float)an), 0.03f, 0, 9);
+            if (bar >= 4 && st % 2 == 0 && lead[bar - 4][st / 2])            // melody in the second half
+                mNote(mix, N, t, 2 * step * 1.8f, midiHz((float)lead[bar - 4][st / 2]), 0.13f, 1, 2.2f);
+            if (st == 0 || st == 8 || (st == 10 && bar % 2)) mKick(mix, N, t, 0.9f);   // drums
+            if (st == 4 || st == 12) mSnare(mix, N, t, 0.5f);
+            if (st % 2 == 0) mHat(mix, N, t, st == 14 ? 0.22f : 0.13f, st == 14 ? 28.0f : 70.0f);
+        }
+    }
+    int dataBytes = N * 2;
+    musicWavSize = 44 + dataBytes;
+    musicWav = malloc(musicWavSize);
+    unsigned char *h = musicWav;
+    #define W32(o, v) do { unsigned u_ = (unsigned)(v); h[o] = u_ & 255; h[(o)+1] = (u_ >> 8) & 255; h[(o)+2] = (u_ >> 16) & 255; h[(o)+3] = (u_ >> 24) & 255; } while (0)
+    memcpy(h, "RIFF", 4); W32(4, musicWavSize - 8); memcpy(h + 8, "WAVEfmt ", 8); W32(16, 16);
+    h[20] = 1; h[21] = 0; h[22] = 1; h[23] = 0; W32(24, MUS_SR); W32(28, MUS_SR * 2); h[32] = 2; h[33] = 0; h[34] = 16; h[35] = 0;
+    memcpy(h + 36, "data", 4); W32(40, dataBytes);
+    short *pcm = (short *)(h + 44);   // 44-byte header keeps this 2-byte aligned
+    for (int i = 0; i < N; i++) pcm[i] = (short)(tanhf(mix[i] * 1.1f) * 0.85f * 32767);
+    free(mix);
+    if (getenv("RACE_DUMPMUSIC")) { FILE *f = fopen(getenv("RACE_DUMPMUSIC"), "wb"); if (f) { fwrite(musicWav, 1, musicWavSize, f); fclose(f); } }
+    titleMusic = LoadMusicStreamFromMemory(".wav", musicWav, musicWavSize);
+    musicOK = IsMusicValid(titleMusic);
+    if (musicOK) titleMusic.looping = true;
+    else fprintf(stderr, "title music failed to load\n");
 }
 
 // ---------------------------------------------------------------- helpers
@@ -208,6 +306,13 @@ static void buildTrack(void) {
 }
 
 // ---------------------------------------------------------------- elevation & warning signs
+static void buildCurvature(void) {
+    float seg = trkLen / NSEG;
+    for (int i = 0; i < NSEG; i++) {
+        Vector2 a = trk[(i - 4 + NSEG) % NSEG].t, b = trk[(i + 4) % NSEG].t;
+        trkK[i] = fabsf(atan2f(a.x * b.y - a.y * b.x, Vector2DotProduct(a, b))) / (8 * seg);
+    }
+}
 static float yAt(Vector2 p, int idx) {
     TP *a = &trk[idx];
     float seg = trkLen / NSEG, t = Vector2DotProduct(Vector2Subtract(p, a->p), a->t) / seg;
@@ -315,7 +420,7 @@ static float cdOf(Car *c, int w) {
     return wcd[w] * m;
 }
 
-static float battCap(Car *c) { return 10.0f * (1 + 0.5f * c->u.ammo); }
+static float battCap(Car *c) { return (classic && c->ai) ? 4.0f : 10.0f * (1 + 0.5f * c->u.ammo); }
 static int gridSlot(int i) {   // classic: starting grid follows the championship standings
     if (!classic) return i;
     #define GKEY(x) ((x) == 0 ? score : champ[x]) * 10 + ((x) == 0 ? 0 : 6 - (x))
@@ -337,6 +442,12 @@ static void initCar(int i) {
     static const char *names[MAXCARS] = {"YOU", "VIPER", "REAPER", "SKULL", "BLAZE", "NOVA"};
     static const Color cols[MAXCARS] = {{40,120,255,255},{230,50,50,255},{230,200,40,255},{150,60,200,255},{255,130,20,255},{40,200,120,255}};
     c->name = names[i]; c->col = cols[i]; c->ai = i > 0;
+    c->type = i == 0 ? carType : (i + raceIdx) % 3;
+    if (i == 0) c->col = carPalette[carColor];
+    else {   // don't let an AI share the player's colour
+        Color pc = carPalette[carColor];
+        if (c->col.r == pc.r && c->col.g == pc.g && c->col.b == pc.b) c->col = carColor == 0 ? (Color){120, 120, 130, 255} : carPalette[0];
+    }
     int r = raceIdx;
     c->accel = 42; c->gripN = 7; c->steerK = 1.9f; c->accFall = 0.6f;
     if (i == 0) {
@@ -349,13 +460,22 @@ static void initCar(int i) {
             c->steerK = 1.5f + 0.1f * pu.tires;
         }
     } else {
-        c->maxv = classic ? 37.0f + r * 1.9f + rf(0, 8.0f) : 40.0f + r * 0.9f + rf(0, 7);
+        {
+            // classic: two leaders (VIPER, REAPER) get away; the other three form a pack near a stock car's pace
+            static const float tierOff[MAXCARS] = {0, 13.0f, 10.0f, 3.0f, 1.5f, 0.0f};
+            c->maxv = classic ? 31.0f + r * 1.9f + tierOff[i] + rf(0, 2.0f) : 40.0f + r * 0.9f + rf(0, 7);
+            if (getenv("RACE_DEBUG")) fprintf(stderr, "AI %s maxv=%.1f\n", c->name, c->maxv);
+        }
         c->u = (Upg){r / 2 + (r > 0 ? GetRandomValue(0, 1) : 0), (r + GetRandomValue(0, 3)) / 4, (r + GetRandomValue(0, 3)) / 4,
                      (r + GetRandomValue(0, 2)) / 3, r / 4, r / 4, r / 3};
         if (c->u.armor > 5) c->u.armor = 5;
         if (c->u.gun > 4) c->u.gun = 4;
     }
-    c->maxhp = 100 + 30 * c->u.armor;
+    {   // car type modifiers
+        const CarType *ct = &ctypes[c->type];
+        c->maxv *= ct->spd; c->accel *= ct->acc; c->gripN *= ct->grip; c->mass = ct->mass;
+        c->maxhp = ct->hp + 30 * c->u.armor;
+    }
     // grid slot: in classic mode you start at the very back until you have won on this track
     int slot = gridSlot(i);
     c->lane = (slot % 2 ? 1 : -1) * 5.0f;
@@ -363,6 +483,9 @@ static void initCar(int i) {
     c->lap = 0; c->hp = c->maxhp;
     c->meshDirty = true;
     for (int w = 0; w < NW; w++) c->ammo[w] = (int)(ammoStart[w] * (1 + 0.5f * c->u.ammo));
+    if (classic && i > 0) {   // classic AI cars are short on ammo too
+        c->ammo[W_GUN] = 50; c->ammo[W_MISSILE] = 1; c->ammo[W_MINE] = 1; c->ammo[W_CALT] = 1;
+    }
     if (classic && i == 0) {  // consumables and damage carry over between races
         for (int w = 0; w < NW; w++) c->ammo[w] = pAmmo[w];
         if (pHp >= 0) c->hp = fminf(pHp, c->maxhp);
@@ -397,6 +520,7 @@ static void loadTrack(int i) {
     buildTrack();
     buildBridge();
     buildSigns();
+    buildCurvature();
     const TrackDef *T = TDEF;
     float minx = 1e9f, maxx = -1e9f, minz = 1e9f, maxz = -1e9f;
     for (int k = 0; k < NSEG; k++) {
@@ -451,6 +575,7 @@ static void dent(Car *c, Vector2 src, float strength) {
 }
 static void hitCar(Car *c, float dmg, int owner, Vector2 src) {
     if (!c->alive || c->invuln > 0) return;
+    if (classic && c == &cars[0] && owner > 0) dmg *= 0.6f;   // classic: AI fire is less lethal
     dent(c, src, dmg);
     damageCar(c, dmg, owner);
 }
@@ -486,6 +611,7 @@ void damageCar(Car *c, float d, int owner) {
     if (c->hp <= 0) {
         c->hp = 0; c->alive = false; c->respawn = 3.5f;
         explode(c->p, 0, 0, -1, true);
+        if (classic) for (int d = 0; d < 9; d++) dent(c, Vector2Add(c->p, (Vector2){rf(-3, 3), rf(-3, 3)}), rf(25, 50));   // mangled hulk
         for (int i = 0; i < 30; i++)
             part((Vector3){c->p.x, 1, c->p.y}, (Vector3){rf(-8, 8), rf(3, 14), rf(-8, 8)}, rf(0.6f, 1.6f), 0.5f, c->col);
         int self = (int)(c - cars);
@@ -539,14 +665,14 @@ static void fireWeapon(Car *c, int ci, int w) {
             break;
         }
     } else if (w == W_LASER) {
-        float best = 140; int hit = -1;
+        float best = 1e9f; int hit = -1;   // unlimited range
         for (int k = 0; k < MAXCARS; k++) {
             if (k == ci || !cars[k].alive || fabsf(cars[k].y - c->y) > 3.5f) continue;
             Vector2 rel = Vector2Subtract(cars[k].p, c->p);
             float along = Vector2DotProduct(rel, f), lat = fabsf(Vector2DotProduct(rel, r));
             if (along > 0 && along < best && lat < 2.4f) { best = along; hit = k; }
         }
-        Vector2 e = Vector2Add(c->p, Vector2Scale(f, best));
+        Vector2 e = Vector2Add(c->p, Vector2Scale(f, hit >= 0 ? best : 1500.0f));   // a miss draws a long beam
         for (int i = 0; i < 32; i++) if (beams[i].life <= 0) {
             beams[i] = (Beam){{nose.x, c->y + 1.0f, nose.y}, {e.x, c->y + 1.0f, e.y}, 0.12f, (Color){255, 40, 40, 255}};
             break;
@@ -573,6 +699,11 @@ static void fireWeapon(Car *c, int ci, int w) {
 
 // ---------------------------------------------------------------- car physics
 static void updateCar(Car *c, int ci, Ctl *k, float dt) {
+    if (c->gone) return;   // finished and left the track
+    if (c->finished && c->alive) {
+        if (c->ai) { c->finT += dt; if (c->finT > 2.0f) { c->alive = false; c->gone = true; return; } }   // cool-down, then leave
+        else c->invuln = 100;   // the player's finished car can no longer be hurt
+    }
     if (!c->alive) {
         if (classic) return;   // classic: wrecks stay wrecked
         c->respawn -= dt;
@@ -599,7 +730,19 @@ static void updateCar(Car *c, int ci, Ctl *k, float dt) {
     c->steer += (target - c->steer) * fminf(1, 9 * dt);
     float rate = c->steerK * Clamp(fabsf(vf) / 10, 0, 1) / (1 + fabsf(vf) / 55);
     if (k->hb) rate *= 1.5f;
-    c->h -= c->steer * rate * dt * (vf >= -1 ? 1 : -1);
+    float omega = c->steer * rate;                       // yaw rate the driver is asking for (rad/s)
+    // Tyre limit: following a turn needs lateral acceleration = speed * yaw rate. Beyond what the tyres can
+    // grip the front end washes out (understeer): the car turns less than asked, scrubs speed and smokes.
+    float aMax = c->gripN * 3.5f * (c->flat > 0 ? 0.43f : 1.0f) * (k->hb ? 1.5f : 1.0f);
+    float aReq = fabsf(vf * omega);
+    if (aReq > aMax) {
+        float over = aReq / aMax;
+        omega /= over;
+        c->v = Vector2Scale(c->v, 1 - Clamp(over - 1, 0, 1.5f) * 0.45f * dt);
+        if (over > 1.15f && GetRandomValue(0, 1) == 0)
+            part((Vector3){c->p.x - f.x * 1.5f, 0.2f, c->p.y - f.y * 1.5f}, (Vector3){rf(-1, 1), rf(0.5f, 1.5f), rf(-1, 1)}, 0.7f, 0.6f, (Color){190, 190, 190, 150});
+    }
+    c->h -= omega * dt * (vf >= -1 ? 1 : -1);
     f = fwdOf(c->h);
     Vector2 r = {-f.y, f.x};
     vf = Vector2DotProduct(c->v, f);
@@ -634,6 +777,7 @@ static void updateCar(Car *c, int ci, Ctl *k, float dt) {
         float vn = Vector2DotProduct(c->v, t->r) * s;
         if (vn > 0) {
             c->v = Vector2Subtract(c->v, Vector2Scale(t->r, s * vn * 1.4f));
+            if (getenv("RACE_DEBUG") && vn > 6) fprintf(stderr, "WALLHIT car=%d speed=%.0f km/h vn=%.1f idx=%d\n", ci, Vector2Length(c->v) * 3.6f, vn, c->idx);
             if (vn > 4) dent(c, Vector2Add(c->p, Vector2Scale(t->r, s)), vn * 0.9f);
             if (vn > 6) { damageCar(c, vn * 0.35f, -1); if (!c->ai) shake = fmaxf(shake, 0.2f); }
             for (int i = 0; i < 4; i++)
@@ -642,7 +786,7 @@ static void updateCar(Car *c, int ci, Ctl *k, float dt) {
         c->v = Vector2Scale(c->v, 1 - 0.8f * dt);
     }
     // weapons
-    for (int w = 0; w < NW; w++) if (k->fire[w]) fireWeapon(c, ci, w);
+    if (!c->finished) for (int w = 0; w < NW; w++) if (k->fire[w]) fireWeapon(c, ci, w);   // no shooting after the flag
     // pickups
     for (int i = 0; i < npicks; i++) {
         Pickup *pk = &picks[i];
@@ -681,28 +825,59 @@ static void updateCar(Car *c, int ci, Ctl *k, float dt) {
 }
 
 // ---------------------------------------------------------------- AI
+// highest speed from which the car can still make every upcoming corner (grip-limited), braking at a sane rate
+static float cornerSpeed(Car *c) {
+    float seg = trkLen / NSEG, best = c->maxv;
+    float aMax = c->gripN * 3.5f * (c->flat > 0 ? 0.43f : 1.0f) * 0.8f;   // keep 20% in reserve
+    for (int j = 1; j <= 75; j++) {
+        float kj = fmaxf(trkK[(c->idx + j) % NSEG], 1e-4f);
+        float vj = sqrtf(aMax / kj), d = j * seg;
+        float allowed = sqrtf(vj * vj + 2 * 32.0f * d);
+        if (allowed < best) best = allowed;
+    }
+    return best;
+}
 static void aiControl(Car *c, int ci, Ctl *k, float dt) {
     memset(k, 0, sizeof(*k));
     if (!c->alive) return;
     float speed = Vector2Length(c->v);
     int look = 6 + (int)(speed * 0.18f);
     TP *t = &trk[(c->idx + look) % NSEG];
-    Vector2 tgt = Vector2Add(t->p, Vector2Scale(t->r, c->lane));
+    float laneT = c->lane;
+    float wreckCap = 1e9f;
+    if (classic) for (int w = 0; w < MAXCARS; w++) {   // steer around wrecks on the track
+        Car *wk = &cars[w];
+        if (wk->alive || wk->gone || fabsf(wk->y - c->y) > 3) continue;
+        int dI = (wk->idx - c->idx + NSEG) % NSEG;
+        if (dI < 3 || dI > look + 28) continue;
+        float offw = Vector2DotProduct(Vector2Subtract(wk->p, trk[wk->idx].p), trk[wk->idx].r);
+        float cur = Vector2DotProduct(Vector2Subtract(c->p, trk[c->idx].p), trk[c->idx].r);
+        float a = offw - 5.5f, b = offw + 5.5f;
+        bool aok = fabsf(a) <= 11, bok = fabsf(b) <= 11;
+        if (aok && bok) laneT = fabsf(a - cur) < fabsf(b - cur) ? a : b;
+        else if (aok) laneT = a; else if (bok) laneT = b; else laneT = offw > 0 ? -9.0f : 9.0f;
+        wreckCap = 26.0f;
+    }
+    Vector2 tgt = Vector2Add(t->p, Vector2Scale(t->r, laneT));
     Vector2 f = fwdOf(c->h), d = Vector2Subtract(tgt, c->p);
     float ang = atan2f(f.x * d.y - f.y * d.x, Vector2DotProduct(f, d));
     k->steer = Clamp(ang * 2.2f, -1, 1);
-    float curv = acosf(Clamp(Vector2DotProduct(trk[(c->idx + 8) % NSEG].t, trk[(c->idx + 35) % NSEG].t), -1, 1));
-    float tv = c->maxv * (1 - Clamp(curv * 1.5f, 0, 0.6f));
-    if (speed < tv) k->thr = 1;
-    else if (speed > tv + 6) k->thr = -1;
+    float tv = fminf(cornerSpeed(c), wreckCap);
+    if (speed < tv - 1) k->thr = 1;
+    else if (speed > tv + 2) k->thr = -1;
     if (fabsf(ang) > 1.0f && speed > 15) k->hb = true;
     // stuck
     if (speed < 3 && state == ST_RACE) c->stuck += dt; else c->stuck = 0;
     if (c->stuck > 2.5f) { respawnCar(c); }
     // combat
+    if (c->finished) { k->thr = 0; return; }   // coast over the line, no more fighting
     c->aiT -= dt;
     if (c->aiT > 0 || state != ST_RACE || raceT < 8) return;
     c->aiT = 0.05f;
+    if (classic) {   // guns fire in short bursts with long rests
+        if (c->aiBurst > 0) { c->aiBurst -= 0.05f; if (c->aiBurst <= 0) c->aiRest = 2.5f + rf(0, 2.5f); }   // burst over -> rest
+        else c->aiRest -= 0.05f;
+    }
     Vector2 r = {-f.y, f.x};
     for (int o = 0; o < MAXCARS; o++) {
         if (o == ci || !cars[o].alive || fabsf(cars[o].y - c->y) > 3 || (classic && o != 0)) continue;   // classic: AI cars fight only you
@@ -710,10 +885,17 @@ static void aiControl(Car *c, int ci, Ctl *k, float dt) {
         float dist = Vector2Length(rel), along = Vector2DotProduct(rel, f), lat = fabsf(Vector2DotProduct(rel, r));
         if (along > 0) {
             float skill = Clamp((c->maxv - 40) / 15, 0, 1);
-            if (dist < 70 && lat < 3.5f && GetRandomValue(0, 100) < 40 + skill * 30) k->fire[W_GUN] = true;
-            if (dist < 100 && lat < 2.2f && GetRandomValue(0, 100) < 12) k->fire[W_LASER] = true;
-            if (dist < 140 && dist > 20 && lat < dist * 0.3f && GetRandomValue(0, 100) < 8) k->fire[W_MISSILE] = true;
-        } else if (dist < 40 && lat < 9 && GetRandomValue(0, 100) < 7) {
+            if (classic) {
+                if (dist < 60 && lat < 3.0f && c->aiBurst <= 0 && c->aiRest <= 0) c->aiBurst = 0.7f;   // start a burst
+                if (c->aiBurst > 0 && dist < 70 && lat < 3.5f) k->fire[W_GUN] = true;
+                if (dist < 100 && lat < 2.2f && GetRandomValue(0, 1000) < 15) k->fire[W_LASER] = true;
+                if (dist < 140 && dist > 20 && lat < dist * 0.3f && GetRandomValue(0, 1000) < 10) k->fire[W_MISSILE] = true;
+            } else {
+                if (dist < 70 && lat < 3.5f && GetRandomValue(0, 100) < 40 + skill * 30) k->fire[W_GUN] = true;
+                if (dist < 100 && lat < 2.2f && GetRandomValue(0, 100) < 12) k->fire[W_LASER] = true;
+                if (dist < 140 && dist > 20 && lat < dist * 0.3f && GetRandomValue(0, 100) < 8) k->fire[W_MISSILE] = true;
+            }
+        } else if (dist < 40 && lat < 9 && GetRandomValue(0, classic ? 1000 : 100) < (classic ? 12 : 7)) {
             k->fire[GetRandomValue(0, 1) ? W_MINE : W_CALT] = true;
         }
     }
@@ -737,7 +919,8 @@ static void updateWorld(float dt) {
             float rv = Vector2DotProduct(Vector2Subtract(b->v, a->v), n);
             if (rv < 0) {
                 Vector2 imp = Vector2Scale(n, rv * 0.9f);
-                a->v = Vector2Add(a->v, imp); b->v = Vector2Subtract(b->v, imp);
+                float ma = a->mass > 0 ? a->mass : 1, mb = b->mass > 0 ? b->mass : 1;   // heavier car gets shoved less
+                a->v = Vector2Add(a->v, Vector2Scale(imp, 2 * mb / (ma + mb))); b->v = Vector2Subtract(b->v, Vector2Scale(imp, 2 * ma / (ma + mb)));
                 float im = -rv;
                 if (im > 3) {
                     dent(a, b->p, im * 0.8f); dent(b, a->p, im * 0.8f);
@@ -754,8 +937,37 @@ static void updateWorld(float dt) {
                         }
                     }
                 }
-                if (im > 8) { damageCar(a, im * 0.3f, j); damageCar(b, im * 0.3f, i);
+                if (im > 8) { damageCar(a, im * 0.3f * sqrtf(mb / ma), j); damageCar(b, im * 0.3f * sqrtf(ma / mb), i);
                     for (int s = 0; s < 6; s++) part((Vector3){a->p.x + n.x * CAR_R, 0.8f, a->p.y + n.y * CAR_R}, (Vector3){rf(-5, 5), rf(1, 6), rf(-5, 5)}, 0.3f, 0.2f, YELLOW); }
+            }
+        }
+    }
+    // wrecks (classic): immovable obstacles that smoulder for the whole race
+    if (classic) for (int w = 0; w < MAXCARS; w++) {
+        Car *wk = &cars[w];
+        if (wk->alive || wk->gone) continue;
+        wk->respawn += dt;   // age of the wreck
+        baseY = wk->y;
+        if (Vector2DistanceSqr(wk->p, cars[0].p) < 200.0f * 200.0f && GetRandomValue(0, 5) == 0)
+            part((Vector3){wk->p.x + rf(-1, 1), 0.9f, wk->p.y + rf(-1, 1)}, (Vector3){rf(-0.5f, 0.5f), rf(2, 4), rf(-0.5f, 0.5f)}, rf(1.0f, 2.0f), rf(0.8f, 1.6f), (Color){45, 45, 45, 190});
+        if (wk->respawn < 25 && GetRandomValue(0, 12) == 0)
+            part((Vector3){wk->p.x + rf(-1, 1), 0.8f, wk->p.y + rf(-1, 1)}, (Vector3){rf(-0.5f, 0.5f), rf(1, 3), rf(-0.5f, 0.5f)}, 0.4f, 0.4f, ORANGE);
+        for (int j = 0; j < MAXCARS; j++) {
+            Car *c = &cars[j];
+            if (!c->alive || fabsf(c->y - wk->y) > 3) continue;
+            Vector2 dlt = Vector2Subtract(c->p, wk->p);
+            float d = Vector2Length(dlt);
+            if (d >= CAR_R * 2 || d < 0.001f) continue;
+            Vector2 n = Vector2Scale(dlt, 1 / d);
+            c->p = Vector2Add(c->p, Vector2Scale(n, CAR_R * 2 - d));
+            float vn = Vector2DotProduct(c->v, n);
+            if (vn < 0) {
+                c->v = Vector2Scale(Vector2Subtract(c->v, Vector2Scale(n, vn * 1.4f)), 0.85f);
+                baseY = c->y;
+                if (getenv("RACE_DEBUG")) fprintf(stderr, "WRECKHIT car=%d speed=%.0f km/h\n", j, -vn * 3.6f);
+                if (-vn > 3) dent(c, wk->p, -vn * 0.9f);
+                if (-vn > 6) { hitCar(c, -vn * 0.35f, -1, wk->p); if (j == 0) shake = fmaxf(shake, 0.3f); }
+                for (int sp = 0; sp < 4; sp++) part((Vector3){c->p.x - n.x * 1.5f, 0.6f, c->p.y - n.y * 1.5f}, (Vector3){rf(-4, 4), rf(1, 5), rf(-4, 4)}, 0.3f, 0.2f, YELLOW);
             }
         }
     }
@@ -1000,6 +1212,9 @@ static void tri(Vector3 a, Vector3 b, Vector3 c3, Color col) {
 }
 static void drawCarModel(Car *c, bool tiltDamage) {
     if (c->meshDirty) rebuildMesh(c);
+    const CarType *ct = &ctypes[c->type];
+    rlPushMatrix();
+    rlScalef(ct->sx, ct->sy, ct->sz);
     float hpr = Clamp(c->hp / c->maxhp, 0, 1);
     Color dark = (Color){25, 25, 28, 255};
     static const float shade[5] = {1.0f, 0.78f, 0.78f, 0.68f, 0.6f};
@@ -1057,6 +1272,18 @@ static void drawCarModel(Car *c, bool tiltDamage) {
             DrawCylinderEx((Vector3){x, 0.95f, z}, (Vector3){x, 0.95f, z + dir * len * 0.8f}, 0.08f, 0.0f, 5, (Color){210, 210, 220, 255});
         }
     }
+    if (c->type == 1) {   // HORNET: big rear wing, front splitter
+        DrawCube((Vector3){0, 1.85f, -2.0f}, 2.7f, 0.08f, 0.7f, (Color){20, 20, 24, 255});
+        DrawCube((Vector3){0, 0.4f, 2.25f}, 1.9f, 0.08f, 0.5f, (Color){20, 20, 24, 255});
+    } else if (c->type == 2) {   // CRUSHER: roll cage, exhaust stacks, roof lamps
+        DrawCube((Vector3){0, 1.95f, -0.3f}, 1.7f, 0.1f, 0.1f, (Color){60, 60, 66, 255});
+        DrawCube((Vector3){-0.8f, 1.65f, -0.3f}, 0.1f, 0.6f, 0.1f, (Color){60, 60, 66, 255});
+        DrawCube((Vector3){0.8f, 1.65f, -0.3f}, 0.1f, 0.6f, 0.1f, (Color){60, 60, 66, 255});
+        DrawCylinderEx((Vector3){-0.55f, 1.0f, -0.95f}, (Vector3){-0.55f, 1.9f, -0.95f}, 0.12f, 0.12f, 8, (Color){130, 130, 140, 255});
+        DrawCylinderEx((Vector3){0.55f, 1.0f, -0.95f}, (Vector3){0.55f, 1.9f, -0.95f}, 0.12f, 0.12f, 8, (Color){130, 130, 140, 255});
+        for (int l = -1; l <= 1; l += 2) DrawCube((Vector3){l * 0.45f, 2.0f, -0.3f}, 0.3f, 0.2f, 0.2f, (Color){255, 240, 150, 255});
+    }
+    rlPopMatrix();
     (void)tiltDamage;
 }
 static void drawCar(Car *c, int ci) {
@@ -1124,7 +1351,19 @@ static void drawWorld(Camera3D cam) {
             }
         }
     }
-    for (int i = 0; i < MAXCARS; i++) drawCar(&cars[i], i);
+    for (int i = 0; i < MAXCARS; i++) {
+        Car *w = &cars[i];
+        if (classic && !w->alive && !w->gone) {   // burnt-out wreck stays on the track
+            Color keep = w->col; w->col = (Color){38, 34, 32, 255};
+            rlPushMatrix();
+            rlTranslatef(w->p.x, w->y - 0.05f, w->p.y);
+            rlRotatef(w->h * RAD2DEG, 0, 1, 0);
+            rlRotatef(8.0f + (i % 3) * 5.0f, 0, 0, 1);
+            drawCarModel(w, false);
+            rlPopMatrix();
+            w->col = keep;
+        } else drawCar(&cars[i], i);
+    }
     for (int i = 0; i < 256; i++) {
         Proj *p = &proj[i];
         if (!p->on) continue;
@@ -1168,8 +1407,8 @@ static int rankOf(int ci) {
     for (int i = 0; i < MAXCARS; i++) {
         if (i == ci) continue;
         // finished cars rank by finish time (1e6 keeps float precision fine enough to tell finish times apart), then by progress; wrecks last
-        float a = cars[i].finished ? 1e6f - cars[i].finishTime : (cars[i].alive ? cars[i].prog : cars[i].prog - 1e5f);
-        float b = cars[ci].finished ? 1e6f - cars[ci].finishTime : (cars[ci].alive ? cars[ci].prog : cars[ci].prog - 1e5f);
+        float a = cars[i].finished ? 1e6f - cars[i].finishTime : (cars[i].alive || classic ? cars[i].prog : cars[i].prog - 1e5f);
+        float b = cars[ci].finished ? 1e6f - cars[ci].finishTime : (cars[ci].alive || classic ? cars[ci].prog : cars[ci].prog - 1e5f);
         if (a > b) r++;
     }
     return r;
@@ -1198,7 +1437,7 @@ static void drawHUD(Camera3D cam) {
         bool ready = pl->ammo[w] > 0 && pl->cd[w] <= 0;
         DrawRectangle(x, H - 70, 110, 52, (Color){0, 0, 0, 160});
         DrawRectangleLines(x, H - 70, 110, 52, ready ? WHITE : GRAY);
-        DrawText(TextFormat("[%s] %s", wkey[w], (classic && w == W_LASER) ? "BATTERY" : wname[w]), x + 6, H - 64, 14, ready ? WHITE : GRAY);
+        DrawText(TextFormat("[%s] %s", wkey[w], wname[w]), x + 6, H - 64, 14, ready ? WHITE : GRAY);
         DrawText(TextFormat("%d", pl->ammo[w]), x + 6, H - 44, 24, pl->ammo[w] ? YELLOW : RED);
         if (classic && w == W_LASER) {   // recharge bar
             DrawRectangle(x + 40, H - 36, 62, 8, (Color){60, 60, 60, 255});
@@ -1241,7 +1480,10 @@ static void drawHUD(Camera3D cam) {
     DrawRectangle(mx - 8, my - 8, 196, 196, (Color){0, 0, 0, 140});
     #define MM(p) (Vector2){mx + (maxx - (p).x) * sc, my + 170 - ((p).y - minz) * sc}   // +Z up; the right-hand side of the map is world -X (same as the driver's right)
     for (int i = 0; i < NSEG; i += 4) DrawLineV(MM(trk[i].p), MM(trk[(i + 4) % NSEG].p), GRAY);
-    for (int i = 0; i < MAXCARS; i++) if (cars[i].alive) DrawCircleV(MM(cars[i].p), i == 0 ? 5 : 3.5f, cars[i].col);
+    for (int i = 0; i < MAXCARS; i++) {
+        if (cars[i].alive) DrawCircleV(MM(cars[i].p), i == 0 ? 5 : 3.5f, cars[i].col);
+        else if (classic && !cars[i].gone) { Vector2 q = MM(cars[i].p); DrawLineEx((Vector2){q.x - 3, q.y - 3}, (Vector2){q.x + 3, q.y + 3}, 2, RED); DrawLineEx((Vector2){q.x - 3, q.y + 3}, (Vector2){q.x + 3, q.y - 3}, 2, RED); }
+    }
 }
 
 static void drawCenter(const char *s, int y, int size, Color c) {
@@ -1284,7 +1526,7 @@ static int *itemLvl(int i) {
     int *p[10] = {&pu.armor, &pu.fspike, &pu.rspike, &pu.gun, &pu.missile, &pu.laser, &pu.ammo, &pu.engine, &pu.trans, &pu.tires};
     return p[i];
 }
-static float playerMaxHp(void) { return 100 + 30.0f * pu.armor; }
+static float playerMaxHp(void) { return ctypes[carType].hp + 30.0f * pu.armor; }
 static float playerHp(void) { return pHp < 0 ? playerMaxHp() : fminf(pHp, playerMaxHp()); }
 static int ammoCapP(int w) { return (int)(ammoMax[w] * (1 + 0.5f * pu.ammo)); }
 static int repairAmt(void) { float m = playerMaxHp() - playerHp(); return (int)ceilf(fminf(20, m)); }
@@ -1320,7 +1562,7 @@ static bool buyItem(int i) {
 }
 
 #define SAVE_MAGIC 0x1A0AE
-typedef struct { int magic, raceIdx, money, score; Upg u; float hp; int ammo[NW]; unsigned char won_unused[NRACES]; int champ[MAXCARS]; } Save;
+typedef struct { int magic, raceIdx, money, score; Upg u; float hp; int ammo[NW]; unsigned char won_unused[NRACES]; int champ[MAXCARS]; int carType, carColor; } Save;
 #define SAVE_V1_SIZE offsetof(Save, champ)   // older saves end before the championship table
 static const char *savePath(int m) { return m ? "ironroad_classic.sav" : "ironroad_arcade.sav"; }
 static bool readSave(int m, Save *sv) {
@@ -1333,7 +1575,7 @@ static bool readSave(int m, Save *sv) {
     return ok;
 }
 static void saveGame(void) {
-    Save sv = {SAVE_MAGIC, raceIdx, money, score, pu, pHp, {0}, {0}, {0}};
+    Save sv = {SAVE_MAGIC, raceIdx, money, score, pu, pHp, {0}, {0}, {0}, carType, carColor};
     for (int w = 0; w < NW; w++) sv.ammo[w] = pAmmo[w];
     for (int w = 1; w < MAXCARS; w++) sv.champ[w] = champ[w];
     FILE *f = fopen(savePath(mode), "wb");
@@ -1345,10 +1587,11 @@ static bool loadGame(int m) {
     raceIdx = sv.raceIdx; money = sv.money; score = sv.score; pu = sv.u; pHp = sv.hp;
     for (int w = 0; w < NW; w++) pAmmo[w] = sv.ammo[w];
     for (int w = 1; w < MAXCARS; w++) champ[w] = sv.champ[w];
+    carType = sv.carType >= 0 && sv.carType < 3 ? sv.carType : 0; carColor = sv.carColor >= 0 && sv.carColor < 8 ? sv.carColor : 0;
     return true;
 }
 static void resetProgress(void) {
-    raceIdx = 0; score = 0; memset(&pu, 0, sizeof pu); memset(champ, 0, sizeof champ);
+    raceIdx = 0; score = 0; memset(&pu, 0, sizeof pu); memset(champ, 0, sizeof champ); carType = 0; carColor = 0;
     money = classic ? 1500 : 1000;
     pHp = -1;
     static const int startAmmo[NW] = {100, 2, 2, 1, 1};
@@ -1409,7 +1652,8 @@ static void drawStoreUI(int sel) {
     if (top > n - vis) top = n - vis;
     DrawRectangle(20, 20, 560, H - 40, (Color){0, 0, 0, 180});
     DrawText("GARAGE", 40, 34, 44, ORANGE);
-    DrawText(classic ? "CLASSIC" : "ARCADE", 230, 50, 22, classic ? RED : SKYBLUE);
+    DrawText(classic ? "CLASSIC" : "ARCADE", 230, 40, 22, classic ? RED : SKYBLUE);
+    DrawText(ctypes[carType].name, 230, 64, 18, LIGHTGRAY);
     DrawText(TextFormat("$%d", money), 400, 40, 36, GREEN);
     DrawText(TextFormat("Next: Race %d/%d  %s", raceIdx + 1, NRACES, tracksDef[raceIdx < NRACES ? raceIdx : NRACES - 1].name), 40, 86, 22, WHITE);
     for (int r = 0; r < vis; r++) {
@@ -1457,6 +1701,37 @@ static void drawStoreUI(int sel) {
                  W - 20 - 560, H - 40, 20, WHITE);
 }
 
+static void drawCarSelUI(void) {
+    int H = GetScreenHeight();
+    DrawRectangle(20, 20, 560, H - 40, (Color){0, 0, 0, 180});
+    DrawText("CHOOSE YOUR CAR", 40, 34, 40, ORANGE);
+    DrawText(classic ? "CLASSIC" : "ARCADE", 40, 82, 22, classic ? RED : SKYBLUE);
+    for (int t = 0; t < 3; t++) {
+        int y = 130 + t * 64;
+        bool on = t == carType;
+        DrawRectangle(30, y - 4, 540, 58, on ? (Color){255, 140, 0, 80} : (Color){255, 255, 255, 12});
+        DrawText(ctypes[t].name, 50, y + 8, 30, on ? WHITE : LIGHTGRAY);
+        if (on) DrawText("^  v", 480, y + 12, 26, ORANGE);
+    }
+    const CarType *ct = &ctypes[carType];
+    int y0 = 340;
+    struct { const char *n; float v; } bars[5] = {
+        {"TOP SPEED", (ct->spd - 0.85f) / 0.3f}, {"ACCELERATION", (ct->acc - 0.8f) / 0.4f}, {"GRIP", (ct->grip - 0.85f) / 0.3f},
+        {"ARMOR", ct->hp / 150.0f}, {"WEIGHT", ct->mass / 1.6f}};
+    for (int b = 0; b < 5; b++) {
+        DrawText(bars[b].n, 50, y0 + b * 34, 18, LIGHTGRAY);
+        DrawRectangle(230, y0 + b * 34 + 2, 300, 16, (Color){60, 60, 60, 255});
+        DrawRectangle(230, y0 + b * 34 + 2, (int)(300 * Clamp(bars[b].v, 0.05f, 1)), 16, ORANGE);
+    }
+    DrawText(ct->desc, 40, y0 + 5 * 34 + 8, 16, YELLOW);
+    DrawText("COLOR", 50, H - 150, 18, LIGHTGRAY);
+    for (int c = 0; c < 8; c++) {
+        DrawRectangle(130 + c * 52, H - 156, 42, 30, carPalette[c]);
+        if (c == carColor) DrawRectangleLinesEx((Rectangle){128.0f + c * 52, H - 158.0f, 46, 34}, 3, WHITE);
+    }
+    DrawText("UP/DOWN car     LEFT/RIGHT color     ENTER confirm     ESC back", 40, H - 70, 17, LIGHTGRAY);
+}
+
 // ---------------------------------------------------------------- main
 int main(void) {
     SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT | FLAG_WINDOW_RESIZABLE);
@@ -1475,16 +1750,17 @@ int main(void) {
         sBeep = synth(1250, 1250, 0.09f, 0, 6, 0);        // missile lock
         sBeepMine = synth(480, 480, 0.13f, 0, 5, 0);       // mine ahead (low)
         sBeepCalt = synth(1900, 1300, 0.07f, 0, 6, 0);     // caltrops ahead (chirp)
+        { double t0 = GetTime(); buildTitleMusic(); if (getenv("RACE_DEBUG")) fprintf(stderr, "title music built in %.0f ms\n", (GetTime() - t0) * 1000); }
     }
     rlDisableBackfaceCulling();
     rlSetClipPlanes(1.0, 3500.0);   // a tight near/far range keeps depth precision high (prevents road/ground z-fighting)
     SetRandomSeed(7);
     remove("ironroad.log");
+    if (getenv("RACE_CAR")) sscanf(getenv("RACE_CAR"), "%d,%d", &carType, &carColor);   // test hook
     mode = 0; classic = false;
     if (getenv("RACE_CLASSIC")) { mode = 1; classic = true; }
     int menuSel0 = mode;
-    resetProgress();
-    loadGame(mode);
+    { int ct0 = carType, cc0 = carColor; resetProgress(); loadGame(mode); if (getenv("RACE_CAR")) { carType = ct0; carColor = cc0; } }
     const char *at = getenv("RACE_AUTOTEST");
     bool autotest = at != NULL;
     if (autotest) {
@@ -1511,10 +1787,17 @@ int main(void) {
             dent(c, (Vector2){-1, -5}, 45); c->hp = c->maxhp * 0.4f;
         }
     }
-    else if (autotest && !getenv("RACE_MENU")) { state = ST_COUNT; stateT = 0; }
+    else if (autotest && !getenv("RACE_MENU") && !getenv("RACE_CARSEL")) { state = ST_COUNT; stateT = 0; }
+    if (getenv("RACE_CARSEL")) { initCar(0); state = ST_CARSEL; stateT = 0; }
     if (getenv("RACE_BRIDGE") && hasBridge) {   // test hook: player under the flyover, another car on top of it
         cars[0].idx = (bridgeLo + NSEG - 10) % NSEG; respawnCar(&cars[0]); cars[0].invuln = 0; camH = cars[0].h;
         cars[1].idx = bridgeHi; respawnCar(&cars[1]); cars[1].invuln = 0;
+    }
+    if (getenv("RACE_WRECK") && classic) {   // test hook: car 1 is wrecked at the given track index
+        int wi = atoi(getenv("RACE_WRECK")) % NSEG;
+        cars[1].idx = wi; respawnCar(&cars[1]); cars[1].invuln = 0; cars[1].lap = 0; cars[1].prog = (float)wi;
+        damageCar(&cars[1], 1e6f, 0);
+        if (getenv("RACE_WRECK_OFFSET")) cars[1].p = Vector2Add(cars[1].p, Vector2Scale(trk[wi].r, (float)atof(getenv("RACE_WRECK_OFFSET"))));
     }
     if (getenv("RACE_TELEPORT")) { cars[0].idx = atoi(getenv("RACE_TELEPORT")) % NSEG; respawnCar(&cars[0]); cars[0].invuln = 0; camH = cars[0].h; }
 
@@ -1543,9 +1826,19 @@ int main(void) {
             if (IsKeyPressed(KEY_DOWN) || IsKeyPressed(KEY_S) || IsKeyPressed(KEY_UP) || IsKeyPressed(KEY_W)) menuSel ^= 1;
             if (IsKeyPressed(KEY_N) || IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) || IsKeyPressed(KEY_SPACE)) {
                 mode = menuSel; classic = mode == 1;
-                if (IsKeyPressed(KEY_N) || !loadGame(mode)) { newGame(); sel = 0; }
-                enterStore();
+                if (IsKeyPressed(KEY_N) || !loadGame(mode)) {   // new campaign: pick a car first
+                    newGame(); sel = 0; loadTrack(0); newRace();
+                    state = ST_CARSEL; stateT = 0;
+                } else enterStore();
             }
+        } else if (state == ST_CARSEL) {
+            bool ch = false;
+            if (IsKeyPressed(KEY_DOWN) || IsKeyPressed(KEY_S)) { carType = (carType + 1) % 3; ch = true; }
+            if (IsKeyPressed(KEY_UP) || IsKeyPressed(KEY_W)) { carType = (carType + 2) % 3; ch = true; }
+            if (IsKeyPressed(KEY_RIGHT) || IsKeyPressed(KEY_D)) { carColor = (carColor + 1) % 8; ch = true; }
+            if (IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_A)) { carColor = (carColor + 7) % 8; ch = true; }
+            if (ch) { initCar(0); snd(sPick, 0.4f, 1.3f); }
+            if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) { saveGame(); enterStore(); }
         } else if (state == ST_STORE) {
             int ni = nItems(), rows = ni + 1;   // last row is START RACE
             if (sel >= rows) sel = 0;
@@ -1585,6 +1878,7 @@ int main(void) {
                 if (IsKeyPressed(KEY_R) && cars[0].alive) { cars[0].hp -= 15; respawnCar(&cars[0]); cars[0].hp = fmaxf(cars[0].hp, 1); }
             }
             for (int i = autoplay ? 0 : 1; i < MAXCARS; i++) if (go) aiControl(&cars[i], i, &kc[i], dt);
+            if (autoplay && getenv("RACE_NOBRAKE") && go) kc[0].thr = 1;   // test hook: never lift
             if (state == ST_DONE) memset(&kc[0], 0, sizeof kc[0]);  // results screen: no driving/firing input
             for (int i = 0; i < MAXCARS; i++) updateCar(&cars[i], i, &kc[i], dt);
             updateWorld(dt);
@@ -1598,14 +1892,22 @@ int main(void) {
             if (state == ST_RACE) {
                 raceT += dt;
                 if (classic) {
-                    bool anyAI = false;
-                    for (int i = 1; i < MAXCARS; i++) if (cars[i].alive) anyAI = true;
+                    bool anyAI = false;   // anyone still racing, or who already finished ahead of you
+                    for (int i = 1; i < MAXCARS; i++) if (cars[i].alive || cars[i].finished) anyAI = true;
                     if (cars[0].alive && !anyAI && !cars[0].finished) {
                         cars[0].finished = true; cars[0].finishTime = raceT; addMsg("LAST CAR STANDING!");
                     }
                     if (!cars[0].alive) { deadT += dt; if (deadT > 2.5f) finishRace(true); }
                 }
                 if (getenv("RACE_KILL")) { static bool killed; if (!killed && raceT > 6) { killed = true; cars[0].invuln = 0; damageCar(&cars[0], 1e6f, 1); } }
+                if (getenv("RACE_RANKTEST") && raceT > 1) {   // rank with the wreck (car 1) ahead vs. after passing it
+                    static bool done; if (!done) { done = true;
+                        float save = cars[0].prog; for (int i = 2; i < MAXCARS; i++) cars[i].prog = 1000;
+                        cars[1].prog = 100; cars[0].prog = 95; int before = rankOf(0);
+                        cars[0].prog = 105; int after = rankOf(0); cars[0].prog = save;
+                        fprintf(stderr, "RANKTEST wreck at prog 100: player at 95 -> P%d, player at 105 -> P%d (5 cars ahead regardless: so wreck counts until passed = %s)\n", before, after, before == after + 1 ? "YES" : "NO");
+                    }
+                }
                 if (getenv("RACE_MTEST")) {   // test hook: AI fires a missile at the player; a mine sits ahead; player "swerves" after 0.7s
                     static int mt; static float mtT;
                     if (mt == 0 && raceT > 4) {
@@ -1634,6 +1936,17 @@ int main(void) {
             if (!IsSoundPlaying(sEng)) PlaySound(sEng);
         } else if (audioOK && IsSoundPlaying(sEng)) StopSound(sEng);
 
+        // title music: plays on the menu / car-select screens, fades out for the garage and races
+        if (musicOK) {
+            bool menuish = state == ST_MENU || state == ST_CARSEL;
+            musicVol += ((menuish ? 0.5f : 0.0f) - musicVol) * fminf(1, 3 * dt);
+            if (menuish || musicVol > 0.01f) {
+                if (!IsMusicStreamPlaying(titleMusic)) PlayMusicStream(titleMusic);
+                SetMusicVolume(titleMusic, musicVol);
+                UpdateMusicStream(titleMusic);
+            } else if (IsMusicStreamPlaying(titleMusic)) StopMusicStream(titleMusic);
+        }
+
         // camera
         Car *pl = &cars[0];
         if (state == ST_MENU || state == ST_END) {
@@ -1644,7 +1957,7 @@ int main(void) {
             cam.position = (Vector3){ctr.x + sinf(a) * 420, 230, ctr.y + cosf(a) * 420};
             cam.target = (Vector3){ctr.x, 0, ctr.y};
             cam.fovy = 60;
-        } else if (state == ST_STORE) {
+        } else if (state == ST_STORE || state == ST_CARSEL) {
             cam.position = (Vector3){2, 3.2f, 9.5f};
             cam.target = (Vector3){-2.2f, 1.0f, 0};
             cam.fovy = 45;
@@ -1667,10 +1980,10 @@ int main(void) {
         const TrackDef *T = TDEF;
         ClearBackground(T->skyBot);
         DrawRectangleGradientV(0, 0, W, H * 0.55f, T->skyTop, T->skyBot);
-        if (state == ST_STORE) {
+        if (state == ST_STORE || state == ST_CARSEL) {
             DrawRectangleGradientV(0, 0, W, H, (Color){25, 25, 35, 255}, (Color){60, 45, 40, 255});
             drawStoreScene(cam);
-            drawStoreUI(sel);
+            if (state == ST_STORE) drawStoreUI(sel); else drawCarSelUI();
         } else drawWorld(cam);
         if (state == ST_MENU) {
             DrawRectangle(0, 0, W, H, (Color){0, 0, 0, 120});
@@ -1699,7 +2012,7 @@ int main(void) {
             drawCenter(TextFormat("Championship points: %d / %d", score, NRACES * 10), 280, 36, WHITE);
             drawCenter(score >= 80 ? "ROAD LEGEND" : score >= 55 ? "SEASONED KILLER" : score >= 30 ? "ROOKIE WRECKER" : "SCRAPYARD MATERIAL", 340, 40, ORANGE);
             drawCenter("ENTER - back to menu", 450, 26, LIGHTGRAY);
-        } else if (state != ST_STORE) {
+        } else if (state != ST_STORE && state != ST_CARSEL) {
             drawHUD(cam);
             if (state == ST_COUNT) {
                 int n = 3 - (int)stateT;

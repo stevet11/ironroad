@@ -12,6 +12,12 @@ Run from the project folder (`build/ironroad`, or `build\Release\ironroad.exe`).
 
 **Plain make (Linux, or MSYS2 with `make OS=Windows_NT`):** `make && ./ironroad`
 
+## Cars
+Starting a new campaign lets you pick a car and a color (up/down = car, left/right = color):
+**Brawler** (balanced), **Hornet** (light: quicker and grippier, fragile, gets shoved around) and
+**Crusher** (heavy: lots of armor, wins collisions, slower). The AI cars drive all three types too.
+The title screen plays a looping track that is synthesized at startup (no audio files).
+
 ## Game modes
 Pick one on the title screen (each has its own save file, `ironroad_arcade.sav` / `ironroad_classic.sav`).
 
@@ -45,3 +51,4 @@ Track layouts live in `tools/gen_tracks.py` (it validates them and writes `track
 W/S throttle/brake, A/D steer, Space handbrake, F/Ctrl/LMB gun, G homing missile,
 H laser, B mine, V caltrops, R reset, P pause, Esc menu/quit.
 Garage: Up/Down select, Enter buy; start the race with the START RACE row (Enter) or R. Space does nothing there.
+Car select: Up/Down car, Left/Right color, Enter confirm.
