@@ -1,0 +1,8 @@
+build/
+ironroad
+ironroad.exe
+*.sav
+ironroad.log
+shot.png
+*.o
+third_party/

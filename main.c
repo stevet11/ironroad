@@ -1,0 +1,1292 @@
+// IRON ROAD - a Death Track style 3D combat racer. C + raylib. Windows & Linux.
+#include "raylib.h"
+#include "raymath.h"
+#include "rlgl.h"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <string.h>
+
+#define NSEG 800
+#define MAXCARS 6
+static int LAPS = 3;
+static float HALF = 15.0f;
+#define WALL (HALF - 1.2f)
+#define NRACES 10
+#define MAXV 56.0f
+#define CAR_R 2.1f
+
+enum { W_GUN, W_MISSILE, W_LASER, W_MINE, W_CALT, NW };
+static const char *wname[NW] = {"GUN", "MISSILE", "LASER", "MINE", "CALTROPS"};
+static const char *wkey[NW] = {"F", "G", "H", "B", "V"};
+static const int ammoMax[NW] = {300, 12, 20, 12, 12};
+static const int ammoStart[NW] = {150, 4, 6, 3, 3};
+static const float wcd[NW] = {0.07f, 0.9f, 0.7f, 0.6f, 0.6f};
+
+typedef struct { Vector2 p, t, r; } TP;  // centre, tangent, right-hand normal (x,z plane)
+static TP trk[NSEG];
+static float trkLen;
+
+typedef struct { float thr, steer; bool hb, fire[NW]; } Ctl;
+
+typedef struct { int armor, fspike, rspike, gun, missile, laser, ammo; } Upg;
+typedef struct { float x, y, z, dx, dz, r, depth; } Dent;
+#define NDENT 24
+// deformable body lattice: top 9x17, sides 17x4 (x2), ends 9x4 (x2)
+#define NV 361
+
+typedef struct {
+    Vector2 p, v;
+    float h, steer, hp, maxv, lane;
+    int ammo[NW];
+    float cd[NW];
+    int lap, idx, kills, lastAttacker, place;
+    float prog, respawn, invuln, flat, stuck, finishTime, aiT, maxhp;
+    bool ai, alive, finished, meshDirty;
+    Upg u;
+    Dent dents[NDENT]; int ndent;
+    Vector3 bv[NV]; float bd[NV];
+    Color col;
+    const char *name;
+} Car;
+static Car cars[MAXCARS];
+
+typedef struct { bool on; int type; Vector2 p; float y; Vector2 v; int owner; float life; int target; float dmg; } Proj;
+static Proj proj[256];
+typedef struct { bool on; Vector2 p; int owner; float arm, life; } Mine;
+static Mine mines[64];
+typedef struct { bool on; Vector2 p; int owner; float life; } Calt;
+static Calt calts[64];
+typedef struct { Vector2 p; int type; float respawn; } Pickup;
+static Pickup picks[14];
+typedef struct { Vector3 a, b; float life; Color c; } Beam;
+static Beam beams[32];
+typedef struct { Vector3 p, v; float life, max, size; Color c; } Part;
+static Part parts[4000];
+static int partHead;
+typedef struct { Vector3 p; float h, w, d; Color c; int type; } Deco;
+static Deco deco[220];
+
+typedef enum { ST_MENU, ST_STORE, ST_COUNT, ST_RACE, ST_DONE, ST_END } State;
+static State state = ST_MENU;
+static float stateT, raceT, shake;
+static char msgs[5][64];
+static float msgT[5];
+
+// ---------------------------------------------------------------- audio
+static Sound sGun, sMis, sLas, sExp, sMine, sPick, sEng;
+static bool audioOK;
+static Sound synth(float f0, float f1, float dur, float noise, float decay, int saw) {
+    int n = (int)(22050 * dur);
+    short *d = malloc(n * sizeof(short));
+    float ph = 0;
+    for (int i = 0; i < n; i++) {
+        float t = (float)i / n, f = f0 + (f1 - f0) * t;
+        ph += f / 22050.0f;
+        float w = saw ? (2 * (ph - floorf(ph)) - 1) : sinf(ph * 6.2831853f);
+        float nz = (float)GetRandomValue(-1000, 1000) / 1000.0f;
+        float env = expf(-decay * t);
+        d[i] = (short)((w * (1 - noise) + nz * noise) * env * 14000);
+    }
+    Wave w = {n, 22050, 16, 1, d};
+    Sound s = LoadSoundFromWave(w);
+    UnloadWave(w);
+    return s;
+}
+static Sound engineLoop(void) {
+    int n = 22050;
+    short *d = malloc(n * sizeof(short));
+    for (int i = 0; i < n; i++) {
+        float t = (float)i / 22050.0f, s = 0;
+        for (int h = 1; h <= 6; h++) s += sinf(t * 6.2831853f * 50 * h) / h;
+        d[i] = (short)(s * 4500);
+    }
+    Wave w = {n, 22050, 16, 1, d};
+    Sound s = LoadSoundFromWave(w);
+    UnloadWave(w);
+    return s;
+}
+static void snd(Sound s, float vol, float pitch) {
+    if (!audioOK) return;
+    SetSoundVolume(s, vol);
+    SetSoundPitch(s, pitch);
+    PlaySound(s);
+}
+
+// ---------------------------------------------------------------- helpers
+static float rf(float a, float b) { return a + (b - a) * (GetRandomValue(0, 10000) / 10000.0f); }
+static float angDiff(float a, float b) {
+    float d = fmodf(b - a, 2 * PI);
+    if (d > PI) d -= 2 * PI;
+    if (d < -PI) d += 2 * PI;
+    return d;
+}
+static Vector2 fwdOf(float h) { return (Vector2){sinf(h), cosf(h)}; }
+static void addMsg(const char *fmt, ...) {
+    for (int i = 4; i > 0; i--) { memcpy(msgs[i], msgs[i - 1], 64); msgT[i] = msgT[i - 1]; }
+    va_list a; va_start(a, fmt); vsnprintf(msgs[0], 64, fmt, a); va_end(a);
+    msgT[0] = 5;
+}
+static void part(Vector3 p, Vector3 v, float life, float size, Color c) {
+    Part *q = &parts[partHead++ % 4000];
+    q->p = p; q->v = v; q->life = q->max = life; q->size = size; q->c = c;
+}
+static int nearestIdx(Vector2 p, int hint) {
+    int best = hint; float bd = 1e18f;
+    for (int d = -30; d <= 30; d++) {
+        int i = (hint + d + NSEG) % NSEG;
+        float dd = Vector2DistanceSqr(p, trk[i].p);
+        if (dd < bd) { bd = dd; best = i; }
+    }
+    return best;
+}
+
+// ---------------------------------------------------------------- track
+#include "tracks_data.h"
+typedef struct {
+    const char *name, *place;
+    const float (*pts)[2]; int n;
+    float half;
+    Color skyTop, skyBot, ground, road1, road2, wallA, wallB, curb, decoA, decoB;
+    int decoType;  // 0 buildings, 1 trees, 2 rocks, 3 spires, 4 ice
+} TrackDef;
+#define TD(arr) arr, (int)(sizeof(arr) / sizeof(arr[0]))
+static const TrackDef tracksDef[NRACES] = {
+ {"RUST VALLEY","Arizona badlands",TD(TP0),15,{70,120,200,255},{200,190,170,255},{150,110,70,255},{70,66,64,255},{62,58,56,255},{200,60,40,255},{235,230,220,255},{110,100,90,255},{170,100,60,255},{130,80,50,255},2},
+ {"NEON CITY","Tokyo-9 night circuit",TD(TP1),15,{8,6,30,255},{70,20,90,255},{18,18,30,255},{40,40,52,255},{34,34,46,255},{0,220,255,255},{255,40,200,255},{70,70,90,255},{0,180,255,255},{255,50,180,255},0},
+ {"FROZEN PASS","Siberian ice road",TD(TP2),16,{120,160,210,255},{225,235,245,255},{235,240,248,255},{90,100,115,255},{80,90,105,255},{40,90,200,255},{240,240,255,255},{190,205,220,255},{200,225,245,255},{150,190,225,255},4},
+ {"TOXIC SWAMP","Louisiana bayou",TD(TP3),15,{60,90,50,255},{150,170,100,255},{50,70,40,255},{70,64,55,255},{60,55,48,255},{150,200,40,255},{60,60,40,255},{90,80,50,255},{40,100,40,255},{70,120,50,255},1},
+ {"CANYON RUN","Utah red rock",TD(TP4),16,{230,150,90,255},{250,210,150,255},{185,95,55,255},{75,68,66,255},{66,60,58,255},{230,140,30,255},{255,240,200,255},{140,70,40,255},{200,100,50,255},{160,70,40,255},2},
+ {"VOLCANO RING","Hawaii lava fields",TD(TP5),16,{40,10,10,255},{200,70,30,255},{40,28,28,255},{50,46,46,255},{44,40,40,255},{255,90,0,255},{40,30,30,255},{60,45,45,255},{255,100,20,255},{90,50,40,255},3},
+ {"HARBOR DOCKS","Rotterdam shipyards",TD(TP6),17,{110,150,190,255},{200,215,225,255},{75,80,88,255},{66,68,72,255},{58,60,64,255},{255,200,0,255},{30,30,30,255},{120,125,135,255},{200,80,40,255},{40,90,160,255},0},
+ {"MOON BASE","Mare Tranquillitatis",TD(TP7),16,{2,2,8,255},{30,30,50,255},{120,120,125,255},{90,90,96,255},{80,80,86,255},{100,180,255,255},{220,220,230,255},{150,150,160,255},{170,170,180,255},{100,100,115,255},2},
+ {"JUNGLE RUINS","Yucatan temple road",TD(TP8),15,{100,170,120,255},{190,225,160,255},{35,85,35,255},{85,70,50,255},{75,62,44,255},{120,200,60,255},{90,70,40,255},{100,80,50,255},{25,100,30,255},{40,130,45,255},1},
+ {"DEATH TRACK","The final arena",TD(TP9),17,{20,0,0,255},{120,10,10,255},{25,22,24,255},{36,34,36,255},{30,28,30,255},{255,0,0,255},{20,20,20,255},{80,0,0,255},{200,20,20,255},{60,60,60,255},3},
+};
+static int curTrack;
+#define TDEF (&tracksDef[curTrack])
+
+static void buildTrack(void) {
+    const float (*cp)[2] = TDEF->pts;
+    HALF = TDEF->half;
+    const int M = TDEF->n, D = 12000;
+    static Vector2 dense[12000]; static float cum[12001];
+    for (int i = 0; i < D; i++) {
+        float u = (float)i / D * M; int s = (int)u; float f = u - s;
+        Vector2 P[4];
+        for (int k = 0; k < 4; k++) { int j = (s + k - 1 + M) % M; P[k] = (Vector2){cp[j][0], cp[j][1]}; }
+        float f2 = f * f, f3 = f2 * f;
+        dense[i].x = 0.5f * ((2*P[1].x) + (-P[0].x+P[2].x)*f + (2*P[0].x-5*P[1].x+4*P[2].x-P[3].x)*f2 + (-P[0].x+3*P[1].x-3*P[2].x+P[3].x)*f3);
+        dense[i].y = 0.5f * ((2*P[1].y) + (-P[0].y+P[2].y)*f + (2*P[0].y-5*P[1].y+4*P[2].y-P[3].y)*f2 + (-P[0].y+3*P[1].y-3*P[2].y+P[3].y)*f3);
+    }
+    cum[0] = 0;
+    for (int i = 0; i < D; i++) cum[i + 1] = cum[i] + Vector2Distance(dense[i], dense[(i + 1) % D]);
+    trkLen = cum[D];
+    int j = 0;
+    for (int i = 0; i < NSEG; i++) {
+        float target = trkLen * i / NSEG;
+        while (j < D - 1 && cum[j + 1] < target) j++;
+        trk[i].p = dense[j];
+    }
+    for (int i = 0; i < NSEG; i++) {
+        Vector2 t = Vector2Normalize(Vector2Subtract(trk[(i + 1) % NSEG].p, trk[(i + NSEG - 1) % NSEG].p));
+        trk[i].t = t; trk[i].r = (Vector2){-t.y, t.x};
+    }
+}
+
+// ---------------------------------------------------------------- game objects
+static int raceIdx, money, score;
+static Upg pu;  // player's purchased upgrades
+static void explode(Vector2 p, float radius, float dmg, int owner, bool big);
+void damageCar(Car *c, float d, int owner);
+
+static int ammoCap(Car *c, int w) { return (int)(ammoMax[w] * (1 + 0.5f * c->u.ammo)); }
+static float gunDmg(Car *c) { return 3.5f + 1.3f * c->u.gun; }
+static float misDmg(Car *c) { return 45 + 15 * c->u.missile; }
+static float lasDmg(Car *c) { return 22 + 8 * c->u.laser; }
+static float cdOf(Car *c, int w) {
+    float m = 1;
+    if (w == W_GUN) m = 1 - 0.09f * c->u.gun;
+    if (w == W_LASER) m = 1 - 0.1f * c->u.laser;
+    if (w == W_MISSILE) m = 1 - 0.1f * c->u.missile;
+    return wcd[w] * m;
+}
+
+static void respawnCar(Car *c) {
+    TP *t = &trk[c->idx];
+    c->p = Vector2Add(t->p, Vector2Scale(t->r, c->lane * 0.5f));
+    c->h = atan2f(t->t.x, t->t.y);
+    c->v = (Vector2){0, 0};
+    c->steer = 0; c->alive = true; c->invuln = 2.0f; c->flat = 0; c->stuck = 0;
+    if (c->hp <= 0) { c->hp = c->maxhp; c->ndent = 0; c->meshDirty = true; }
+}
+static void initCar(int i) {
+    Car *c = &cars[i];
+    memset(c, 0, sizeof(*c));
+    static const char *names[MAXCARS] = {"YOU", "VIPER", "REAPER", "SKULL", "BLAZE", "NOVA"};
+    static const Color cols[MAXCARS] = {{40,120,255,255},{230,50,50,255},{230,200,40,255},{150,60,200,255},{255,130,20,255},{40,200,120,255}};
+    c->name = names[i]; c->col = cols[i]; c->ai = i > 0;
+    int r = raceIdx;
+    if (i == 0) { c->maxv = MAXV; c->u = pu; }
+    else {
+        c->maxv = 40.0f + r * 0.9f + rf(0, 7);
+        c->u = (Upg){r / 2 + (r > 0 ? GetRandomValue(0, 1) : 0), (r + GetRandomValue(0, 3)) / 4, (r + GetRandomValue(0, 3)) / 4,
+                     (r + GetRandomValue(0, 2)) / 3, r / 4, r / 4, r / 3};
+        if (c->u.armor > 5) c->u.armor = 5;
+        if (c->u.gun > 4) c->u.gun = 4;
+    }
+    c->maxhp = 100 + 30 * c->u.armor;
+    c->lane = (i % 2 ? 1 : -1) * 5.0f;
+    c->idx = NSEG - 6 - (i / 2) * 6;
+    c->lap = 0; c->hp = c->maxhp;
+    c->meshDirty = true;
+    for (int w = 0; w < NW; w++) c->ammo[w] = (int)(ammoStart[w] * (1 + 0.5f * c->u.ammo));
+    c->lastAttacker = -1;
+    respawnCar(c); c->invuln = 0;
+}
+static void newRace(void) {
+    memset(proj, 0, sizeof(proj)); memset(mines, 0, sizeof(mines));
+    memset(calts, 0, sizeof(calts)); memset(beams, 0, sizeof(beams)); memset(parts, 0, sizeof(parts));
+    for (int i = 0; i < MAXCARS; i++) initCar(i);
+    for (int i = 0; i < 14; i++) {
+        int idx = (i * NSEG / 14 + 40) % NSEG;
+        picks[i].p = Vector2Add(trk[idx].p, Vector2Scale(trk[idx].r, rf(-8, 8)));
+        picks[i].type = (i % 3 == 0) ? -1 : GetRandomValue(0, NW - 1);  // -1 = repair
+        picks[i].respawn = 0;
+    }
+    raceT = 0; memset(msgT, 0, sizeof(msgT));
+}
+static void loadTrack(int i) {
+    curTrack = i;
+    buildTrack();
+    const TrackDef *T = TDEF;
+    float minx = 1e9f, maxx = -1e9f, minz = 1e9f, maxz = -1e9f;
+    for (int k = 0; k < NSEG; k++) {
+        minx = fminf(minx, trk[k].p.x); maxx = fmaxf(maxx, trk[k].p.x);
+        minz = fminf(minz, trk[k].p.y); maxz = fmaxf(maxz, trk[k].p.y);
+    }
+    SetRandomSeed(1000 + i * 77);
+    for (int n = 0; n < 220; n++) {
+        for (;;) {
+            Vector2 p = {rf(minx - 250, maxx + 250), rf(minz - 250, maxz + 250)};
+            float best = 1e9f;
+            for (int k = 0; k < NSEG; k += 4) best = fminf(best, Vector2Distance(p, trk[k].p));
+            if (best < 38) continue;
+            float h = rf(3, 22), w = rf(4, 14);
+            Color c = GetRandomValue(0, 1) ? T->decoA : T->decoB;
+            if (T->decoType == 1) { h = rf(6, 16); w = rf(4, 8); }
+            if (T->decoType == 2) { h = rf(2, 9); w = rf(5, 16); }
+            if (T->decoType == 3) { h = rf(10, 34); w = rf(3, 8); }
+            if (T->decoType == 4) { h = rf(3, 14); w = rf(5, 12); }
+            deco[n] = (Deco){{p.x, 0, p.y}, h, w, T->decoType == 0 ? rf(4, 14) : w, c, T->decoType};
+            break;
+        }
+    }
+    SetRandomSeed((unsigned)(GetTime() * 100000) + 13);
+}
+
+// ---- crinkle damage: dents deform the body lattice
+static Vector2 toLocal(Car *c, Vector2 w) {
+    Vector2 d = Vector2Subtract(w, c->p);
+    return (Vector2){d.x * cosf(c->h) - d.y * sinf(c->h), d.x * sinf(c->h) + d.y * cosf(c->h)};
+}
+static void dent(Car *c, Vector2 src, float strength) {
+    Vector2 l = toLocal(c, src);
+    float len = Vector2Length(l);
+    if (len < 0.01f) { l = (Vector2){0, 1}; len = 1; }
+    Vector2 dir = {l.x / len, l.y / len};
+    float t = fminf(fabsf(dir.x) > 1e-4f ? 1.0f / fabsf(dir.x) : 1e9f, fabsf(dir.y) > 1e-4f ? 2.2f / fabsf(dir.y) : 1e9f);
+    float depth = fminf(0.8f, strength * 0.045f), r = Clamp(0.5f + strength * 0.05f, 0.5f, 2.2f);
+    Dent nd = {dir.x * t, 0.7f + rf(-0.15f, 0.25f), dir.y * t, -dir.x, -dir.y, r, depth};
+    c->meshDirty = true;
+    for (int i = 0; i < c->ndent; i++) {
+        Dent *d = &c->dents[i];
+        float dd = sqrtf((d->x - nd.x) * (d->x - nd.x) + (d->z - nd.z) * (d->z - nd.z));
+        if (dd < 0.6f) {
+            d->depth = fminf(0.85f, d->depth + depth * 0.8f);
+            d->r = fmaxf(d->r, r * 0.9f);
+            return;
+        }
+    }
+    if (c->ndent < NDENT) c->dents[c->ndent++] = nd;
+    else c->dents[GetRandomValue(0, NDENT - 1)] = nd;
+}
+static void hitCar(Car *c, float dmg, int owner, Vector2 src) {
+    if (!c->alive || c->invuln > 0) return;
+    dent(c, src, dmg);
+    damageCar(c, dmg, owner);
+}
+
+static void explode(Vector2 p, float radius, float dmg, int owner, bool big) {
+    int n = big ? 60 : 25;
+    for (int i = 0; i < n; i++) {
+        Vector3 v = {rf(-1, 1), rf(0.2f, 1.2f), rf(-1, 1)};
+        v = Vector3Scale(Vector3Normalize(v), rf(4, big ? 22 : 14));
+        part((Vector3){p.x, 0.8f, p.y}, v, rf(0.4f, 1.1f), rf(0.4f, 1.3f), i % 3 ? ORANGE : (i % 3 == 0 ? YELLOW : RED));
+    }
+    for (int i = 0; i < n / 2; i++)
+        part((Vector3){p.x, 1, p.y}, (Vector3){rf(-3, 3), rf(2, 6), rf(-3, 3)}, rf(0.8f, 1.8f), rf(0.8f, 2), (Color){60, 60, 60, 200});
+    snd(sExp, 0.9f, rf(0.8f, 1.1f));
+    for (int i = 0; i < MAXCARS; i++) {
+        Car *c = &cars[i];
+        if (!c->alive) continue;
+        float d = Vector2Distance(c->p, p);
+        if (d < radius) {
+            float dm = dmg * (1 - d / radius * 0.6f);
+            hitCar(c, dm, owner, p);
+            Vector2 push = Vector2Normalize(Vector2Subtract(c->p, p));
+            c->v = Vector2Add(c->v, Vector2Scale(push, 10));
+        }
+    }
+    float dc = Vector2Distance(p, cars[0].p);
+    if (dc < 60) shake = fmaxf(shake, big ? 0.8f : 0.4f);
+}
+void damageCar(Car *c, float d, int owner) {
+    if (!c->alive || c->invuln > 0) return;
+    c->hp -= d;
+    if (owner >= 0 && &cars[owner] != c) c->lastAttacker = owner;
+    if (c->hp <= 0) {
+        c->hp = 0; c->alive = false; c->respawn = 3.5f;
+        explode(c->p, 0, 0, -1, true);
+        for (int i = 0; i < 30; i++)
+            part((Vector3){c->p.x, 1, c->p.y}, (Vector3){rf(-8, 8), rf(3, 14), rf(-8, 8)}, rf(0.6f, 1.6f), 0.5f, c->col);
+        int self = (int)(c - cars);
+        if (c->lastAttacker >= 0 && c->lastAttacker != self) {
+            cars[c->lastAttacker].kills++;
+            addMsg("%s destroyed %s", cars[c->lastAttacker].name, c->name);
+        } else addMsg("%s wrecked", c->name);
+        c->lastAttacker = -1;
+    }
+}
+
+static void fireWeapon(Car *c, int ci, int w) {
+    if (!c->alive || c->cd[w] > 0 || c->ammo[w] <= 0) return;
+    c->cd[w] = cdOf(c, w); c->ammo[w]--;
+    Vector2 f = fwdOf(c->h);
+    Vector2 r = {-f.y, f.x};
+    Vector2 nose = Vector2Add(c->p, Vector2Scale(f, 2.8f));
+    float near = Vector2Distance(c->p, cars[0].p);
+    float vol = near < 150 ? (1 - near / 150) : 0.0f;
+    if (w == W_GUN || w == W_MISSILE) {
+        int nb = (w == W_GUN && c->u.gun >= 3) ? 2 : 1;
+        for (int b = 0; b < nb; b++) for (int i = 0; i < 256; i++) if (!proj[i].on) {
+            Proj *p = &proj[i];
+            p->on = true; p->owner = ci; p->y = 0.9f; p->target = -1;
+            float side = 0;
+            if (w == W_GUN) {
+                if (nb == 2) side = b ? 0.5f : -0.5f;
+                else if (c->u.gun == 2) side = (c->ammo[W_GUN] & 1) ? 0.5f : -0.5f;
+            }
+            p->p = Vector2Add(nose, Vector2Scale(r, side));
+            if (w == W_GUN) {
+                float sp = rf(-0.025f, 0.025f);
+                Vector2 d = fwdOf(c->h + sp);
+                p->type = 0; p->life = 1.2f; p->dmg = gunDmg(c);
+                p->v = Vector2Add(Vector2Scale(d, 170), c->v);
+                if (b == 0) snd(sGun, 0.35f * vol, rf(0.9f, 1.2f) - 0.05f * c->u.gun);
+            } else {
+                p->type = 1; p->life = 5; p->v = Vector2Add(Vector2Scale(f, 40), c->v);
+                p->dmg = misDmg(c);
+                float best = 1e9f;
+                for (int k = 0; k < MAXCARS; k++) {
+                    if (k == ci || !cars[k].alive) continue;
+                    Vector2 rel = Vector2Subtract(cars[k].p, c->p);
+                    float d = Vector2Length(rel);
+                    if (d < 200 && Vector2DotProduct(Vector2Normalize(rel), f) > 0.8f && d < best) { best = d; p->target = k; }
+                }
+                snd(sMis, 0.8f * (0.3f + vol), 1);
+            }
+            break;
+        }
+    } else if (w == W_LASER) {
+        float best = 140; int hit = -1;
+        for (int k = 0; k < MAXCARS; k++) {
+            if (k == ci || !cars[k].alive) continue;
+            Vector2 rel = Vector2Subtract(cars[k].p, c->p);
+            float along = Vector2DotProduct(rel, f), lat = fabsf(Vector2DotProduct(rel, r));
+            if (along > 0 && along < best && lat < 2.4f) { best = along; hit = k; }
+        }
+        Vector2 e = Vector2Add(c->p, Vector2Scale(f, best));
+        for (int i = 0; i < 32; i++) if (beams[i].life <= 0) {
+            beams[i] = (Beam){{nose.x, 1.0f, nose.y}, {e.x, 1.0f, e.y}, 0.12f, (Color){255, 40, 40, 255}};
+            break;
+        }
+        if (hit >= 0) {
+            hitCar(&cars[hit], lasDmg(c), ci, c->p);
+            for (int i = 0; i < 10; i++) part((Vector3){e.x, 1, e.y}, (Vector3){rf(-6, 6), rf(0, 6), rf(-6, 6)}, 0.4f, 0.3f, RED);
+        }
+        snd(sLas, 0.6f * (0.3f + vol), rf(0.9f, 1.1f));
+    } else if (w == W_MINE) {
+        for (int i = 0; i < 64; i++) if (!mines[i].on) {
+            mines[i] = (Mine){true, Vector2Subtract(c->p, Vector2Scale(f, 3.5f)), ci, 0.8f, 40};
+            break;
+        }
+        snd(sMine, 0.4f * (0.3f + vol), 1);
+    } else if (w == W_CALT) {
+        for (int i = 0; i < 64; i++) if (!calts[i].on) {
+            calts[i] = (Calt){true, Vector2Subtract(c->p, Vector2Scale(f, 3.5f)), ci, 30};
+            break;
+        }
+        snd(sMine, 0.4f * (0.3f + vol), 1.6f);
+    }
+}
+
+// ---------------------------------------------------------------- car physics
+static void updateCar(Car *c, int ci, Ctl *k, float dt) {
+    if (!c->alive) {
+        c->respawn -= dt;
+        if (c->respawn <= 0) respawnCar(c);
+        return;
+    }
+    c->invuln -= dt; c->flat -= dt;
+    for (int w = 0; w < NW; w++) c->cd[w] -= dt;
+    Vector2 f = fwdOf(c->h);
+    float vf = Vector2DotProduct(c->v, f);
+    float maxv = c->maxv * (c->flat > 0 ? 0.6f : 1);
+    // steering
+    float target = k->steer;
+    c->steer += (target - c->steer) * fminf(1, 9 * dt);
+    float rate = 1.9f * Clamp(fabsf(vf) / 10, 0, 1) / (1 + fabsf(vf) / 55);
+    if (k->hb) rate *= 1.5f;
+    c->h -= c->steer * rate * dt * (vf >= -1 ? 1 : -1);
+    f = fwdOf(c->h);
+    Vector2 r = {-f.y, f.x};
+    vf = Vector2DotProduct(c->v, f);
+    float vl = Vector2DotProduct(c->v, r);
+    if (k->thr > 0) { if (vf < maxv) vf += k->thr * 42 * (1 - 0.6f * fmaxf(vf, 0) / maxv) * dt; }
+    else if (k->thr < 0) { if (vf > 1) vf -= 65 * dt; else vf = fmaxf(vf + k->thr * 25 * dt, -16); }
+    vf -= vf * 0.28f * dt;
+    if (vf > maxv) vf -= (vf - maxv) * 2 * dt;
+    float grip = k->hb ? 1.3f : (c->flat > 0 ? 3.0f : 7.0f);
+    vl *= expf(-grip * dt);
+    if (k->hb) vf *= expf(-0.7f * dt);
+    c->v = Vector2Add(Vector2Scale(f, vf), Vector2Scale(r, vl));
+    c->p = Vector2Add(c->p, Vector2Scale(c->v, dt));
+    // progress / lap
+    int ni = nearestIdx(c->p, c->idx);
+    if (c->idx > NSEG * 0.8f && ni < NSEG * 0.2f) {
+        c->lap++;
+        if (c->lap > LAPS && !c->finished) {
+            c->finished = true; c->finishTime = raceT;
+            addMsg("%s finished!", c->name);
+        } else if (!c->ai) addMsg("LAP %d / %d", c->lap, LAPS);
+    } else if (c->idx < NSEG * 0.2f && ni > NSEG * 0.8f) c->lap--;
+    c->idx = ni;
+    c->prog = c->lap * NSEG + ni;
+    // walls
+    TP *t = &trk[ni];
+    float off = Vector2DotProduct(Vector2Subtract(c->p, t->p), t->r);
+    if (fabsf(off) > WALL) {
+        float s = off > 0 ? 1 : -1;
+        c->p = Vector2Subtract(c->p, Vector2Scale(t->r, off - s * WALL));
+        float vn = Vector2DotProduct(c->v, t->r) * s;
+        if (vn > 0) {
+            c->v = Vector2Subtract(c->v, Vector2Scale(t->r, s * vn * 1.4f));
+            if (vn > 4) dent(c, Vector2Add(c->p, Vector2Scale(t->r, s)), vn * 0.9f);
+            if (vn > 6) { damageCar(c, vn * 0.35f, -1); if (!c->ai) shake = fmaxf(shake, 0.2f); }
+            for (int i = 0; i < 4; i++)
+                part((Vector3){c->p.x, 0.6f, c->p.y}, (Vector3){rf(-4, 4), rf(1, 5), rf(-4, 4)}, 0.3f, 0.2f, YELLOW);
+        }
+        c->v = Vector2Scale(c->v, 1 - 0.8f * dt);
+    }
+    // weapons
+    for (int w = 0; w < NW; w++) if (k->fire[w]) fireWeapon(c, ci, w);
+    // pickups
+    for (int i = 0; i < 14; i++) {
+        Pickup *pk = &picks[i];
+        if (pk->respawn > 0) continue;
+        if (Vector2Distance(pk->p, c->p) < 3.6f) {
+            pk->respawn = 14;
+            if (pk->type < 0) c->hp = fminf(c->maxhp, c->hp + 40);
+            else {
+                static const int amt[NW] = {80, 2, 4, 2, 2};
+                c->ammo[pk->type] = (int)fminf(ammoCap(c, pk->type), c->ammo[pk->type] + amt[pk->type]);
+            }
+            if (!c->ai) { snd(sPick, 0.6f, 1); addMsg(pk->type < 0 ? "Repair +40" : "+%s", pk->type < 0 ? "" : wname[pk->type]); }
+        }
+    }
+    // mines & caltrops
+    for (int i = 0; i < 64; i++) {
+        Mine *m = &mines[i];
+        if (m->on && m->arm <= 0 && Vector2Distance(m->p, c->p) < 2.8f) {
+            m->on = false;
+            explode(m->p, 9, 55, m->owner, true);
+        }
+        Calt *q = &calts[i];
+        if (q->on && Vector2Distance(q->p, c->p) < 3.2f && c->flat < 3.0f) {
+            c->flat = 5; damageCar(c, 6, q->owner);
+            for (int j = 0; j < 12; j++) part((Vector3){c->p.x, 0.3f, c->p.y}, (Vector3){rf(-3, 3), rf(1, 4), rf(-3, 3)}, 0.5f, 0.2f, LIGHTGRAY);
+            if (!c->ai) addMsg("TIRES SHREDDED!");
+        }
+    }
+    // exhaust / flat sparks
+    if (GetRandomValue(0, 3) == 0)
+        part((Vector3){c->p.x - f.x * 2.2f, 0.5f, c->p.y - f.y * 2.2f}, (Vector3){rf(-0.5f, 0.5f), rf(0.5f, 1.5f), rf(-0.5f, 0.5f)}, 0.6f, 0.4f, (Color){120, 120, 120, 140});
+    if (c->flat > 0 && GetRandomValue(0, 1) == 0)
+        part((Vector3){c->p.x, 0.2f, c->p.y}, (Vector3){rf(-2, 2), rf(1, 3), rf(-2, 2)}, 0.25f, 0.15f, ORANGE);
+    if (c->hp < c->maxhp * 0.35f && GetRandomValue(0, 2) == 0)
+        part((Vector3){c->p.x, 1.4f, c->p.y}, (Vector3){rf(-1, 1), rf(2, 4), rf(-1, 1)}, 0.8f, 0.7f, (Color){30, 30, 30, 200});
+}
+
+// ---------------------------------------------------------------- AI
+static void aiControl(Car *c, int ci, Ctl *k, float dt) {
+    memset(k, 0, sizeof(*k));
+    if (!c->alive) return;
+    float speed = Vector2Length(c->v);
+    int look = 6 + (int)(speed * 0.18f);
+    TP *t = &trk[(c->idx + look) % NSEG];
+    Vector2 tgt = Vector2Add(t->p, Vector2Scale(t->r, c->lane));
+    Vector2 f = fwdOf(c->h), d = Vector2Subtract(tgt, c->p);
+    float ang = atan2f(f.x * d.y - f.y * d.x, Vector2DotProduct(f, d));
+    k->steer = Clamp(ang * 2.2f, -1, 1);
+    float curv = acosf(Clamp(Vector2DotProduct(trk[(c->idx + 8) % NSEG].t, trk[(c->idx + 35) % NSEG].t), -1, 1));
+    float tv = c->maxv * (1 - Clamp(curv * 1.5f, 0, 0.55f));
+    if (speed < tv) k->thr = 1;
+    else if (speed > tv + 6) k->thr = -1;
+    if (fabsf(ang) > 1.0f && speed > 15) k->hb = true;
+    // stuck
+    if (speed < 3 && state == ST_RACE) c->stuck += dt; else c->stuck = 0;
+    if (c->stuck > 2.5f) { respawnCar(c); }
+    // combat
+    c->aiT -= dt;
+    if (c->aiT > 0 || state != ST_RACE || raceT < 8) return;
+    c->aiT = 0.05f;
+    Vector2 r = {-f.y, f.x};
+    for (int o = 0; o < MAXCARS; o++) {
+        if (o == ci || !cars[o].alive) continue;
+        Vector2 rel = Vector2Subtract(cars[o].p, c->p);
+        float dist = Vector2Length(rel), along = Vector2DotProduct(rel, f), lat = fabsf(Vector2DotProduct(rel, r));
+        if (along > 0) {
+            float skill = Clamp((c->maxv - 40) / 15, 0, 1);
+            if (dist < 70 && lat < 3.5f && GetRandomValue(0, 100) < 40 + skill * 30) k->fire[W_GUN] = true;
+            if (dist < 100 && lat < 2.2f && GetRandomValue(0, 100) < 12) k->fire[W_LASER] = true;
+            if (dist < 140 && dist > 20 && lat < dist * 0.3f && GetRandomValue(0, 100) < 8) k->fire[W_MISSILE] = true;
+        } else if (dist < 40 && lat < 9 && GetRandomValue(0, 100) < 7) {
+            k->fire[GetRandomValue(0, 1) ? W_MINE : W_CALT] = true;
+        }
+    }
+}
+
+// ---------------------------------------------------------------- world update
+static void updateWorld(float dt) {
+    // car-car collisions
+    for (int i = 0; i < MAXCARS; i++) for (int j = i + 1; j < MAXCARS; j++) {
+        Car *a = &cars[i], *b = &cars[j];
+        if (!a->alive || !b->alive) continue;
+        Vector2 dlt = Vector2Subtract(b->p, a->p);
+        float d = Vector2Length(dlt);
+        if (d < CAR_R * 2 && d > 0.001f) {
+            Vector2 n = Vector2Scale(dlt, 1 / d);
+            float pen = CAR_R * 2 - d;
+            a->p = Vector2Subtract(a->p, Vector2Scale(n, pen / 2));
+            b->p = Vector2Add(b->p, Vector2Scale(n, pen / 2));
+            float rv = Vector2DotProduct(Vector2Subtract(b->v, a->v), n);
+            if (rv < 0) {
+                Vector2 imp = Vector2Scale(n, rv * 0.9f);
+                a->v = Vector2Add(a->v, imp); b->v = Vector2Subtract(b->v, imp);
+                float im = -rv;
+                if (im > 3) {
+                    dent(a, b->p, im * 0.8f); dent(b, a->p, im * 0.8f);
+                    Car *pr[2] = {a, b}; int id[2] = {i, j};
+                    for (int sd = 0; sd < 2; sd++) {
+                        Car *x = pr[sd], *y = pr[1 - sd];
+                        Vector2 nn = sd ? Vector2Scale(n, -1) : n;
+                        float fd = Vector2DotProduct(nn, fwdOf(x->h));
+                        int lvl = fd > 0.5f ? x->u.fspike : (fd < -0.5f ? x->u.rspike : 0);
+                        if (lvl > 0 && y->alive && y->invuln <= 0) {
+                            hitCar(y, lvl * (3 + im * 0.3f), id[sd], x->p);
+                            dent(y, x->p, lvl * 12.0f);
+                            if (!x->ai) addMsg("SPIKED %s!", y->name);
+                        }
+                    }
+                }
+                if (im > 8) { damageCar(a, im * 0.3f, j); damageCar(b, im * 0.3f, i);
+                    for (int s = 0; s < 6; s++) part((Vector3){a->p.x + n.x * CAR_R, 0.8f, a->p.y + n.y * CAR_R}, (Vector3){rf(-5, 5), rf(1, 6), rf(-5, 5)}, 0.3f, 0.2f, YELLOW); }
+            }
+        }
+    }
+    // projectiles
+    for (int i = 0; i < 256; i++) {
+        Proj *p = &proj[i];
+        if (!p->on) continue;
+        p->life -= dt;
+        if (p->type == 1) {  // missile homing
+            if (p->target >= 0 && cars[p->target].alive) {
+                Vector2 want = Vector2Normalize(Vector2Subtract(cars[p->target].p, p->p));
+                float sp = Vector2Length(p->v), cur = atan2f(p->v.x, p->v.y), des = atan2f(want.x, want.y);
+                cur += Clamp(angDiff(cur, des), -2.8f * dt, 2.8f * dt);
+                sp = fminf(sp + 60 * dt, 105);
+                p->v = (Vector2){sinf(cur) * sp, cosf(cur) * sp};
+            } else {
+                float sp = fminf(Vector2Length(p->v) + 60 * dt, 105);
+                p->v = Vector2Scale(Vector2Normalize(p->v), sp);
+            }
+            part((Vector3){p->p.x, p->y, p->p.y}, (Vector3){rf(-1, 1), rf(0, 1), rf(-1, 1)}, 0.5f, 0.5f, (Color){200, 200, 200, 180});
+        }
+        Vector2 np = Vector2Add(p->p, Vector2Scale(p->v, dt));
+        bool kill = p->life <= 0;
+        for (int k = 0; k < MAXCARS && !kill; k++) {
+            Car *c = &cars[k];
+            if (k == p->owner || !c->alive) continue;
+            // segment-vs-circle so fast bullets can't tunnel
+            Vector2 seg = Vector2Subtract(np, p->p);
+            float L2 = Vector2DotProduct(seg, seg), tt = L2 > 0 ? Clamp(Vector2DotProduct(Vector2Subtract(c->p, p->p), seg) / L2, 0, 1) : 0;
+            Vector2 cl = Vector2Add(p->p, Vector2Scale(seg, tt));
+            if (Vector2Distance(cl, c->p) < (p->type ? 2.6f : CAR_R)) {
+                if (p->type == 0) {
+                    hitCar(c, p->dmg, p->owner, p->p);
+                    for (int s = 0; s < 3; s++) part((Vector3){cl.x, 1, cl.y}, (Vector3){rf(-4, 4), rf(0, 4), rf(-4, 4)}, 0.25f, 0.15f, YELLOW);
+                    p->on = false; kill = false;
+                } else { p->p = cl; kill = true; }
+                break;
+            }
+        }
+        if (!p->on) continue;
+        if (!kill) {
+            TP *t = &trk[nearestIdx(np, nearestIdx(p->p, (int)(trkLen ? cars[p->owner].idx : 0)))];
+            float off = Vector2DotProduct(Vector2Subtract(np, t->p), t->r);
+            if (fabsf(off) > HALF) kill = true;
+        }
+        if (kill) {
+            p->on = false;
+            if (p->type == 1) explode(p->p, 11 + (p->dmg - 45) / 10, p->dmg, p->owner, true);
+        } else p->p = np;
+    }
+    for (int i = 0; i < 64; i++) {
+        if (mines[i].on) { mines[i].arm -= dt; mines[i].life -= dt; if (mines[i].life <= 0) mines[i].on = false; }
+        if (calts[i].on) { calts[i].life -= dt; if (calts[i].life <= 0) calts[i].on = false; }
+    }
+    for (int i = 0; i < 14; i++) if (picks[i].respawn > 0) picks[i].respawn -= dt;
+    for (int i = 0; i < 32; i++) beams[i].life -= dt;
+    for (int i = 0; i < 4000; i++) {
+        Part *q = &parts[i];
+        if (q->life <= 0) continue;
+        q->life -= dt;
+        q->p = Vector3Add(q->p, Vector3Scale(q->v, dt));
+        q->v.y -= 12 * dt;
+        if (q->p.y < 0.1f) { q->p.y = 0.1f; q->v.y *= -0.3f; q->v.x *= 0.7f; q->v.z *= 0.7f; }
+    }
+    for (int i = 0; i < 5; i++) msgT[i] -= dt;
+}
+
+// ---------------------------------------------------------------- rendering
+static void quad(Vector3 a, Vector3 b, Vector3 c, Vector3 d, Color col) {
+    DrawTriangle3D(a, b, c, col);
+    DrawTriangle3D(a, c, d, col);
+}
+static Vector3 V3(Vector2 p, float y) { return (Vector3){p.x, y, p.y}; }
+
+static void drawTrack(void) {
+    for (int i = 0; i < NSEG; i++) {
+        TP *a = &trk[i], *b = &trk[(i + 1) % NSEG];
+        Vector2 aL = Vector2Subtract(a->p, Vector2Scale(a->r, HALF)), aR = Vector2Add(a->p, Vector2Scale(a->r, HALF));
+        Vector2 bL = Vector2Subtract(b->p, Vector2Scale(b->r, HALF)), bR = Vector2Add(b->p, Vector2Scale(b->r, HALF));
+        Color rc = (i / 5) % 2 ? TDEF->road1 : TDEF->road2;
+        quad(V3(aL, 0.02f), V3(bL, 0.02f), V3(bR, 0.02f), V3(aR, 0.02f), rc);
+        if (i % 8 < 4) {
+            Vector2 w = {0.25f, 0.25f};
+            (void)w;
+            Vector2 al = Vector2Subtract(a->p, Vector2Scale(a->r, 0.25f)), ar = Vector2Add(a->p, Vector2Scale(a->r, 0.25f));
+            Vector2 bl = Vector2Subtract(b->p, Vector2Scale(b->r, 0.25f)), br = Vector2Add(b->p, Vector2Scale(b->r, 0.25f));
+            quad(V3(al, 0.04f), V3(bl, 0.04f), V3(br, 0.04f), V3(ar, 0.04f), (Color){220, 200, 60, 255});
+        }
+        Color wc = (i / 4) % 2 ? TDEF->wallA : TDEF->wallB;
+        quad(V3(aL, 0), V3(bL, 0), V3(bL, 1.3f), V3(aL, 1.3f), wc);
+        quad(V3(aR, 0), V3(bR, 0), V3(bR, 1.3f), V3(aR, 1.3f), wc);
+        quad(V3(aL, 1.3f), V3(bL, 1.3f), V3(Vector2Subtract(b->p, Vector2Scale(b->r, HALF + 1.2f)), 1.3f), V3(Vector2Subtract(a->p, Vector2Scale(a->r, HALF + 1.2f)), 1.3f), TDEF->curb);
+        quad(V3(aR, 1.3f), V3(bR, 1.3f), V3(Vector2Add(b->p, Vector2Scale(b->r, HALF + 1.2f)), 1.3f), V3(Vector2Add(a->p, Vector2Scale(a->r, HALF + 1.2f)), 1.3f), TDEF->curb);
+    }
+    // start / finish line
+    for (int k = 0; k < 10; k++) for (int j = 0; j < 2; j++) {
+        Vector2 c0 = Vector2Add(trk[0].p, Vector2Add(Vector2Scale(trk[0].r, -HALF + 1.5f * k + 0.75f), Vector2Scale(trk[0].t, j * 1.5f)));
+        DrawCube(V3(c0, 0.06f), 1.5f, 0.05f, 1.5f, (k + j) % 2 ? WHITE : BLACK);
+    }
+}
+
+// lattice helpers: body half extents
+#define BX 1.0f
+#define BY 0.35f
+#define BZ 2.2f
+static float hash3(Vector3 p) {
+    float v = sinf(roundf(p.x * 50) * 127.1f + roundf(p.y * 50) * 311.7f + roundf(p.z * 50) * 74.7f) * 43758.5453f;
+    return v - floorf(v);
+}
+static Vector3 bodyBase(int face, int i, int j) {
+    float u, v;
+    switch (face) {
+    case 0: u = -BX + 2 * BX * i / 8; v = -BZ + 2 * BZ * j / 16; return (Vector3){u, BY, v};
+    case 1: u = -BZ + 2 * BZ * i / 16; v = -BY + 2 * BY * j / 3; return (Vector3){BX, v, u};
+    case 2: u = -BZ + 2 * BZ * i / 16; v = -BY + 2 * BY * j / 3; return (Vector3){-BX, v, u};
+    case 3: u = -BX + 2 * BX * i / 8; v = -BY + 2 * BY * j / 3; return (Vector3){u, v, BZ};
+    default: u = -BX + 2 * BX * i / 8; v = -BY + 2 * BY * j / 3; return (Vector3){u, v, -BZ};
+    }
+}
+static const int faceNU[5] = {8, 16, 16, 8, 8}, faceNV[5] = {16, 3, 3, 3, 3}, faceOff[5] = {0, 153, 221, 289, 325};
+static void rebuildMesh(Car *c) {
+    for (int f = 0; f < 5; f++)
+        for (int i = 0; i <= faceNU[f]; i++) for (int j = 0; j <= faceNV[f]; j++) {
+            Vector3 p = bodyBase(f, i, j), q = p;
+            Vector3 D = {0, 0, 0}; float dk = 0;
+            for (int n = 0; n < c->ndent; n++) {
+                Dent *d = &c->dents[n];
+                float dx = p.x - d->x, dy = (p.y + 0.7f) - d->y, dz = p.z - d->z;
+                float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+                if (dist >= d->r) continue;
+                float w = 1 - dist / d->r; w *= w;
+                float jag = 0.55f + 0.9f * hash3(p);   // crumple: uneven push per vertex
+                D.x += d->dx * d->depth * w * jag; D.z += d->dz * d->depth * w * jag;
+                D.y += (hash3((Vector3){p.z, p.x, p.y}) - 0.4f) * 0.5f * d->depth * w;
+                dk += w * d->depth;
+            }
+            float m = Vector3Length(D);
+            if (m > 0.8f) D = Vector3Scale(D, 0.8f / m);
+            q = Vector3Add(p, D);
+            int vi = faceOff[f] + i * (faceNV[f] + 1) + j;
+            c->bv[vi] = (Vector3){q.x, q.y + 0.7f, q.z};
+            c->bd[vi] = dk;
+        }
+    c->meshDirty = false;
+}
+static void tri(Vector3 a, Vector3 b, Vector3 c3, Color col) {
+    rlColor4ub(col.r, col.g, col.b, col.a);
+    rlVertex3f(a.x, a.y, a.z); rlVertex3f(b.x, b.y, b.z); rlVertex3f(c3.x, c3.y, c3.z);
+}
+static void drawCarModel(Car *c, bool tiltDamage) {
+    if (c->meshDirty) rebuildMesh(c);
+    float hpr = Clamp(c->hp / c->maxhp, 0, 1);
+    Color dark = (Color){25, 25, 28, 255};
+    static const float shade[5] = {1.0f, 0.78f, 0.78f, 0.68f, 0.6f};
+    rlBegin(RL_TRIANGLES);
+    for (int f = 0; f < 5; f++) {
+        for (int i = 0; i < faceNU[f]; i++) for (int j = 0; j < faceNV[f]; j++) {
+            int W = faceNV[f] + 1, o = faceOff[f];
+            int i00 = o + i * W + j, i10 = o + (i + 1) * W + j, i01 = i00 + 1, i11 = i10 + 1;
+            float dk = (c->bd[i00] + c->bd[i10] + c->bd[i01] + c->bd[i11]) * 0.25f;
+            float k = shade[f] * (1 - fminf(0.55f, dk * 0.9f)) * (0.65f + 0.35f * hpr);
+            Color col = {(unsigned char)(c->col.r * k), (unsigned char)(c->col.g * k), (unsigned char)(c->col.b * k), 255};
+            // scorched/scraped tint where dented
+            if (dk > 0.08f) { col.r = (unsigned char)(col.r * 0.85f + 12); col.g = (unsigned char)(col.g * 0.8f); col.b = (unsigned char)(col.b * 0.8f); }
+            tri(c->bv[i00], c->bv[i10], c->bv[i11], col);
+            tri(c->bv[i00], c->bv[i11], c->bv[i01], col);
+        }
+    }
+    rlEnd();
+    DrawCube((Vector3){0, 0.36f, 0}, 1.9f, 0.1f, 4.2f, dark);
+    float ch = 0.55f * (1 - 0.3f * (1 - hpr));
+    DrawCube((Vector3){0, 1.05f + ch / 2, -0.3f}, 1.6f, ch, 2.0f, (Color){30, 40, 55, 255});
+    DrawCube((Vector3){0, 1.6f, -2.0f}, 2.2f, 0.12f, 0.5f, dark);  // spoiler
+    DrawCube((Vector3){-0.9f, 1.4f, -2.0f}, 0.1f, 0.4f, 0.1f, dark);
+    DrawCube((Vector3){0.9f, 1.4f, -2.0f}, 0.1f, 0.4f, 0.1f, dark);
+    // guns by level
+    DrawCube((Vector3){0, 1.15f, 1.0f}, 0.25f, 0.2f, 2.2f, dark);
+    if (c->u.gun >= 2) { DrawCube((Vector3){-0.5f, 1.1f, 1.2f}, 0.2f, 0.18f, 2.0f, dark); DrawCube((Vector3){0.5f, 1.1f, 1.2f}, 0.2f, 0.18f, 2.0f, dark); }
+    if (c->u.gun >= 4) DrawCube((Vector3){0, 1.2f, 2.3f}, 0.4f, 0.4f, 0.8f, (Color){80, 80, 90, 255});
+    if (c->u.missile > 0) { DrawCube((Vector3){-0.95f, 1.15f, -0.6f}, 0.3f, 0.3f, 1.2f, (Color){200, 200, 200, 255}); DrawCube((Vector3){0.95f, 1.15f, -0.6f}, 0.3f, 0.3f, 1.2f, (Color){200, 200, 200, 255}); }
+    if (c->u.laser > 0) DrawCube((Vector3){0, 1.45f, 0.3f}, 0.3f, 0.25f, 0.5f, (Color){255, 60, 60, 255});
+    // armor plating
+    for (int a = 0; a < c->u.armor; a++) {
+        float y = 0.45f + 0.12f * a;
+        DrawCube((Vector3){-1.08f, y + 0.12f, 0}, 0.1f, 0.1f, 3.4f - 0.2f * a, (Color){90, 92, 100, 255});
+        DrawCube((Vector3){1.08f, y + 0.12f, 0}, 0.1f, 0.1f, 3.4f - 0.2f * a, (Color){90, 92, 100, 255});
+    }
+    for (int sx = -1; sx <= 1; sx += 2) for (int sz = -1; sz <= 1; sz += 2)
+        DrawCube((Vector3){sx * 1.15f, 0.45f, sz * 1.4f}, 0.35f, 0.9f, 0.9f, dark);
+    DrawCube((Vector3){-0.6f, 0.75f, BZ + 0.02f}, 0.4f, 0.15f, 0.05f, YELLOW);
+    DrawCube((Vector3){0.6f, 0.75f, BZ + 0.02f}, 0.4f, 0.15f, 0.05f, YELLOW);
+    // spikes
+    for (int e = 0; e < 2; e++) {
+        int lvl = e ? c->u.rspike : c->u.fspike;
+        if (lvl <= 0) continue;
+        float z = e ? -BZ - 0.1f : BZ + 0.15f, dir = e ? -1.0f : 1.0f;
+        float len = 0.5f + 0.35f * lvl;
+        int n = 2 + lvl * 2;
+        DrawCube((Vector3){0, 0.65f, z - dir * 0.1f}, 2.1f, 0.15f, 0.2f, (Color){70, 70, 75, 255});
+        for (int s = 0; s < n; s++) {
+            float x = -0.9f + 1.8f * s / (n - 1);
+            DrawCylinderEx((Vector3){x, 0.65f, z}, (Vector3){x, 0.65f, z + dir * len}, 0.1f, 0.0f, 5, (Color){210, 210, 220, 255});
+        }
+        if (lvl >= 3) for (int s = 0; s < 3; s++) {
+            float x = -0.6f + 0.6f * s;
+            DrawCylinderEx((Vector3){x, 0.95f, z}, (Vector3){x, 0.95f, z + dir * len * 0.8f}, 0.08f, 0.0f, 5, (Color){210, 210, 220, 255});
+        }
+    }
+    (void)tiltDamage;
+}
+static void drawCar(Car *c, int ci) {
+    if (!c->alive) return;
+    if (c->invuln > 0 && ((int)(c->invuln * 12) & 1)) return;
+    rlPushMatrix();
+    rlTranslatef(c->p.x, 0, c->p.y);
+    rlRotatef(c->h * RAD2DEG, 0, 1, 0);
+    drawCarModel(c, true);
+    rlPopMatrix();
+    (void)ci;
+}
+
+static void drawWorld(Camera3D cam) {
+    BeginMode3D(cam);
+    DrawPlane((Vector3){0, -0.05f, 0}, (Vector2){3000, 3000}, TDEF->ground);
+    for (int i = 0; i < 220; i++) {
+        Deco *d = &deco[i];
+        switch (d->type) {
+        case 1:
+            DrawCylinderEx((Vector3){d->p.x, 0, d->p.z}, (Vector3){d->p.x, d->h * 0.4f, d->p.z}, d->w * 0.1f, d->w * 0.08f, 6, (Color){80, 55, 30, 255});
+            DrawCylinderEx((Vector3){d->p.x, d->h * 0.25f, d->p.z}, (Vector3){d->p.x, d->h, d->p.z}, d->w * 0.5f, 0, 7, d->c);
+            break;
+        case 2: DrawCube((Vector3){d->p.x, d->h / 2, d->p.z}, d->w, d->h, d->d, d->c);
+                DrawCube((Vector3){d->p.x + d->w * 0.3f, d->h * 0.8f, d->p.z}, d->w * 0.5f, d->h * 0.8f, d->d * 0.6f, ColorBrightness(d->c, 0.1f)); break;
+        case 3: case 4:
+            DrawCylinderEx((Vector3){d->p.x, 0, d->p.z}, (Vector3){d->p.x, d->h, d->p.z}, d->w * 0.5f, 0, 5, d->c); break;
+        default:
+            DrawCube((Vector3){d->p.x, d->h / 2, d->p.z}, d->w, d->h, d->d, ColorBrightness(d->c, -0.35f));
+            DrawCube((Vector3){d->p.x, d->h + 0.3f, d->p.z}, d->w + 0.4f, 0.6f, d->d + 0.4f, d->c);
+            break;
+        }
+    }
+    drawTrack();
+    for (int i = 0; i < 14; i++) {
+        Pickup *pk = &picks[i];
+        if (pk->respawn > 0) continue;
+        Color c = pk->type < 0 ? GREEN : (Color[]){YELLOW, ORANGE, RED, PURPLE, SKYBLUE}[pk->type];
+        float bob = 1.2f + sinf(GetTime() * 3 + i) * 0.25f;
+        rlPushMatrix();
+        rlTranslatef(pk->p.x, bob, pk->p.y);
+        rlRotatef(GetTime() * 90, 0, 1, 0);
+        DrawCube((Vector3){0, 0, 0}, 1.4f, 1.4f, 1.4f, c);
+        DrawCubeWires((Vector3){0, 0, 0}, 1.6f, 1.6f, 1.6f, WHITE);
+        rlPopMatrix();
+    }
+    for (int i = 0; i < 64; i++) {
+        if (mines[i].on) {
+            DrawCylinder(V3(mines[i].p, 0.05f), 1.0f, 1.1f, 0.4f, 12, (Color){50, 50, 50, 255});
+            bool blink = mines[i].arm <= 0 && ((int)(GetTime() * 4) & 1);
+            DrawSphere(V3(mines[i].p, 0.5f), 0.22f, blink ? RED : MAROON);
+        }
+        if (calts[i].on) {
+            for (int s = 0; s < 9; s++) {
+                float a = s * 2.4f, rr = 0.4f + (s % 3) * 0.9f;
+                Vector3 b = {calts[i].p.x + cosf(a) * rr, 0.03f, calts[i].p.y + sinf(a) * rr};
+                DrawCylinderEx(b, (Vector3){b.x, 0.7f, b.z}, 0.18f, 0.0f, 4, LIGHTGRAY);
+            }
+        }
+    }
+    for (int i = 0; i < MAXCARS; i++) drawCar(&cars[i], i);
+    for (int i = 0; i < 256; i++) {
+        Proj *p = &proj[i];
+        if (!p->on) continue;
+        if (p->type == 0) {
+            Vector2 d = Vector2Scale(Vector2Normalize(p->v), 2.5f);
+            DrawCylinderEx((Vector3){p->p.x, p->y, p->p.y}, (Vector3){p->p.x - d.x, p->y, p->p.y - d.y}, 0.08f, 0.08f, 4, (Color){255, 240, 120, 255});
+        } else {
+            rlPushMatrix();
+            rlTranslatef(p->p.x, p->y, p->p.y);
+            rlRotatef(atan2f(p->v.x, p->v.y) * RAD2DEG, 0, 1, 0);
+            DrawCube((Vector3){0, 0, 0}, 0.4f, 0.4f, 1.8f, (Color){220, 220, 220, 255});
+            DrawCube((Vector3){0, 0, 1.0f}, 0.3f, 0.3f, 0.4f, RED);
+            DrawCube((Vector3){0, 0, -1.0f}, 0.2f, 0.2f, 0.4f, ORANGE);
+            rlPopMatrix();
+        }
+    }
+    rlDrawRenderBatchActive();
+    for (int i = 0; i < 32; i++) if (beams[i].life > 0) {
+        Beam *b = &beams[i];
+        float a = beams[i].life / 0.12f;
+        DrawCylinderEx(b->a, b->b, 0.35f * a, 0.35f * a, 6, (Color){255, 60, 60, 120});
+        DrawCylinderEx(b->a, b->b, 0.1f, 0.1f, 6, WHITE);
+    }
+    for (int i = 0; i < 4000; i++) {
+        Part *q = &parts[i];
+        if (q->life <= 0) continue;
+        float a = q->life / q->max;
+        Color c = q->c; c.a = (unsigned char)(c.a * a);
+        DrawCube(q->p, q->size * (0.4f + a), q->size * (0.4f + a), q->size * (0.4f + a), c);
+    }
+    EndMode3D();
+}
+
+static void drawBar(int x, int y, int w, int h, float f, Color c) {
+    DrawRectangle(x - 2, y - 2, w + 4, h + 4, (Color){0, 0, 0, 170});
+    DrawRectangle(x, y, (int)(w * Clamp(f, 0, 1)), h, c);
+}
+
+static int rankOf(int ci) {
+    int r = 1;
+    for (int i = 0; i < MAXCARS; i++) {
+        if (i == ci) continue;
+        float a = cars[i].finished ? 1e9f - cars[i].finishTime : cars[i].prog;
+        float b = cars[ci].finished ? 1e9f - cars[ci].finishTime : cars[ci].prog;
+        if (a > b) r++;
+    }
+    return r;
+}
+
+static void drawHUD(Camera3D cam) {
+    int W = GetScreenWidth(), H = GetScreenHeight();
+    Car *pl = &cars[0];
+    // enemy health bars
+    for (int i = 1; i < MAXCARS; i++) {
+        Car *c = &cars[i];
+        if (!c->alive || Vector2Distance(c->p, pl->p) > 110) continue;
+        Vector3 wp = {c->p.x, 3.0f, c->p.y};
+        if (Vector3DotProduct(Vector3Subtract(wp, cam.position), Vector3Subtract(cam.target, cam.position)) <= 0) continue;
+        Vector2 sp = GetWorldToScreen(wp, cam);
+        drawBar((int)sp.x - 25, (int)sp.y, 50, 5, c->hp / c->maxhp, c->col);
+        DrawText(c->name, (int)sp.x - MeasureText(c->name, 14) / 2, (int)sp.y - 16, 14, WHITE);
+    }
+    // health
+    DrawText("ARMOR", 20, H - 70, 16, WHITE);
+    drawBar(20, H - 48, 240, 18, pl->hp / pl->maxhp, pl->hp > pl->maxhp * 0.35f ? (Color){60, 200, 60, 255} : RED);
+    if (pl->flat > 0) DrawText("FLAT TIRES", 20, H - 92, 20, ORANGE);
+    // weapons
+    for (int w = 0; w < NW; w++) {
+        int x = 290 + w * 118;
+        bool ready = pl->ammo[w] > 0 && pl->cd[w] <= 0;
+        DrawRectangle(x, H - 70, 110, 52, (Color){0, 0, 0, 160});
+        DrawRectangleLines(x, H - 70, 110, 52, ready ? WHITE : GRAY);
+        DrawText(TextFormat("[%s] %s", wkey[w], wname[w]), x + 6, H - 64, 14, ready ? WHITE : GRAY);
+        DrawText(TextFormat("%d", pl->ammo[w]), x + 6, H - 44, 24, pl->ammo[w] ? YELLOW : RED);
+    }
+    // speed / lap / pos
+    int kmh = (int)(Vector2Length(pl->v) * 3.6f);
+    DrawText(TextFormat("%d", kmh), W - 190, H - 100, 60, WHITE);
+    DrawText("km/h", W - 80, H - 70, 20, LIGHTGRAY);
+    int lap = pl->lap < 1 ? 1 : (pl->lap > LAPS ? LAPS : pl->lap);
+    DrawText(TextFormat("LAP %d/%d", lap, LAPS), 20, 20, 30, WHITE);
+    DrawText(TextFormat("POS %d/%d", rankOf(0), MAXCARS), 20, 56, 30, YELLOW);
+    DrawText(TextFormat("TIME %.1f", raceT), 20, 92, 20, LIGHTGRAY);
+    DrawText(TextFormat("KILLS %d", pl->kills), 20, 116, 20, LIGHTGRAY);
+    if (Vector2DotProduct(pl->v, trk[pl->idx].t) < -6)
+        DrawText("WRONG WAY", W / 2 - MeasureText("WRONG WAY", 50) / 2, 120, 50, RED);
+    if (!pl->alive) DrawText("WRECKED", W / 2 - MeasureText("WRECKED", 60) / 2, H / 2 - 30, 60, RED);
+    for (int i = 0; i < 5; i++) if (msgT[i] > 0) DrawText(msgs[i], W / 2 - MeasureText(msgs[i], 22) / 2, 20 + i * 26, 22, Fade(WHITE, fminf(1, msgT[i])));
+    // minimap
+    float minx = 1e9f, maxx = -1e9f, minz = 1e9f, maxz = -1e9f;
+    for (int i = 0; i < NSEG; i++) {
+        minx = fminf(minx, trk[i].p.x); maxx = fmaxf(maxx, trk[i].p.x);
+        minz = fminf(minz, trk[i].p.y); maxz = fmaxf(maxz, trk[i].p.y);
+    }
+    float sc = 170 / fmaxf(maxx - minx, maxz - minz);
+    int mx = W - 200, my = 20;
+    DrawRectangle(mx - 8, my - 8, 196, 196, (Color){0, 0, 0, 140});
+    #define MM(p) (Vector2){mx + ((p).x - minx) * sc, my + 170 - ((p).y - minz) * sc}
+    for (int i = 0; i < NSEG; i += 4) DrawLineV(MM(trk[i].p), MM(trk[(i + 4) % NSEG].p), GRAY);
+    for (int i = 0; i < MAXCARS; i++) if (cars[i].alive) DrawCircleV(MM(cars[i].p), i == 0 ? 5 : 3.5f, cars[i].col);
+}
+
+static void drawCenter(const char *s, int y, int size, Color c) {
+    DrawText(s, GetScreenWidth() / 2 - MeasureText(s, size) / 2, y, size, c);
+}
+
+// ---- tiny diagnostic log (ironroad.log) to help track down "it froze" reports
+static void logf_(const char *fmt, ...) {
+    FILE *f = fopen("ironroad.log", "a");
+    if (!f) return;
+    va_list a; va_start(a, fmt);
+    fprintf(f, "[%7.2f] ", GetTime()); vfprintf(f, fmt, a); fputc('\n', f);
+    va_end(a); fclose(f);
+}
+// ---------------------------------------------------------------- store / campaign
+typedef struct { const char *name, *desc; int max, base, step; } Item;
+#define NITEMS 7
+static const Item items[NITEMS] = {
+    {"ARMOR PLATING", "+30 armor per level. Side plates soak the punishment.", 5, 500, 300},
+    {"FRONT SPIKES", "Spiked ram bumper. Head-on hits shred the other car.", 3, 400, 300},
+    {"REAR SPIKES", "Spiked tail. Tailgaters impale themselves.", 3, 400, 300},
+    {"MACHINE GUN", "More damage and fire rate. Lv2 twin barrels, Lv3 double shot, Lv4 heavy cannon.", 4, 400, 300},
+    {"MISSILES", "+15 damage, bigger blast, faster reload. Racks on the roof.", 3, 600, 300},
+    {"LASER", "+8 damage, faster recharge.", 3, 600, 300},
+    {"AMMO BAY", "+50% starting ammo and carrying capacity for every weapon.", 3, 300, 250},
+};
+static int *itemLvl(int i) {
+    int *p[NITEMS] = {&pu.armor, &pu.fspike, &pu.rspike, &pu.gun, &pu.missile, &pu.laser, &pu.ammo};
+    return p[i];
+}
+static int itemPrice(int i) { return items[i].base + items[i].step * *itemLvl(i); }
+
+typedef struct { int magic, raceIdx, money, score; Upg u; } Save;
+static bool hasSave;
+static void saveGame(void) {
+    Save sv = {0x1A0AD, raceIdx, money, score, pu};
+    FILE *f = fopen("ironroad.sav", "wb");
+    if (f) { fwrite(&sv, sizeof sv, 1, f); fclose(f); hasSave = true; }
+}
+static bool loadGame(void) {
+    Save sv;
+    FILE *f = fopen("ironroad.sav", "rb");
+    if (!f) return false;
+    bool ok = fread(&sv, sizeof sv, 1, f) == 1 && sv.magic == 0x1A0AD && sv.raceIdx >= 0 && sv.raceIdx < NRACES;
+    fclose(f);
+    if (ok) { raceIdx = sv.raceIdx; money = sv.money; score = sv.score; pu = sv.u; }
+    return ok;
+}
+static void newGame(void) {
+    raceIdx = 0; money = 1000; score = 0; memset(&pu, 0, sizeof pu);
+    remove("ironroad.sav"); hasSave = false;
+}
+static const int payout[MAXCARS] = {2500, 1700, 1200, 800, 500, 300};
+static const int placePts[MAXCARS] = {10, 7, 5, 3, 2, 1};
+static int lastPay, lastRank;
+
+static void enterStore(void) {
+    loadTrack(raceIdx);
+    newRace();
+    state = ST_STORE; stateT = 0;
+}
+static void drawStoreScene(Camera3D cam) {
+    BeginMode3D(cam);
+    DrawCylinder((Vector3){0, -0.15f, 0}, 5.5f, 5.5f, 0.2f, 40, (Color){45, 48, 55, 255});
+    DrawCylinder((Vector3){0, -0.04f, 0}, 5.6f, 5.6f, 0.04f, 40, ORANGE);
+    rlPushMatrix();
+    rlRotatef(GetTime() * 35, 0, 1, 0);
+    drawCarModel(&cars[0], false);
+    rlPopMatrix();
+    EndMode3D();
+}
+static void drawStoreUI(int sel) {
+    int W = GetScreenWidth(), H = GetScreenHeight();
+    DrawRectangle(20, 20, 560, H - 40, (Color){0, 0, 0, 180});
+    DrawText("GARAGE", 40, 34, 44, ORANGE);
+    DrawText(TextFormat("$%d", money), 400, 40, 36, GREEN);
+    DrawText(TextFormat("Next: Race %d/%d  %s", raceIdx + 1, NRACES, tracksDef[raceIdx].name), 40, 86, 22, WHITE);
+    for (int i = 0; i < NITEMS; i++) {
+        int y = 130 + i * 62, lvl = *itemLvl(i);
+        bool maxed = lvl >= items[i].max, can = !maxed && money >= itemPrice(i);
+        if (i == sel) DrawRectangle(30, y - 4, 540, 56, (Color){255, 140, 0, 70});
+        DrawText(items[i].name, 44, y, 24, i == sel ? WHITE : LIGHTGRAY);
+        for (int p = 0; p < items[i].max; p++)
+            DrawRectangle(44 + p * 22, y + 28, 18, 12, p < lvl ? ORANGE : (Color){70, 70, 70, 255});
+        if (maxed) DrawText("MAX", 480, y + 8, 24, GOLD);
+        else DrawText(TextFormat("$%d", itemPrice(i)), 460, y + 8, 24, can ? GREEN : RED);
+    }
+    DrawText(items[sel].desc, 40, 130 + NITEMS * 62 + 10, 18, YELLOW);
+    int hh = H - 70;
+    DrawText("UP/DOWN select    ENTER buy    SPACE start race    ESC menu", 40, hh, 18, LIGHTGRAY);
+    const TrackDef *T = &tracksDef[raceIdx < NRACES ? raceIdx : NRACES - 1];
+    DrawText(T->place, W - 20 - MeasureText(T->place, 22), 24, 22, LIGHTGRAY);
+    DrawText(T->name, W - 20 - MeasureText(T->name, 40), 48, 40, WHITE);
+    DrawText(TextFormat("Armor %d   Gun dmg %.1f   Missile %.0f   Laser %.0f", (int)cars[0].maxhp, gunDmg(&cars[0]), misDmg(&cars[0]), lasDmg(&cars[0])),
+             W - 20 - 560, H - 40, 20, WHITE);
+}
+
+// ---------------------------------------------------------------- main
+int main(void) {
+    SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT | FLAG_WINDOW_RESIZABLE);
+    InitWindow(1280, 720, "IRON ROAD");
+    SetExitKey(KEY_NULL);
+    InitAudioDevice();
+    audioOK = IsAudioDeviceReady();
+    if (audioOK) {
+        sGun = synth(900, 300, 0.08f, 0.5f, 6, 1);
+        sMis = synth(300, 80, 0.5f, 0.6f, 3, 1);
+        sLas = synth(1800, 200, 0.25f, 0.05f, 4, 0);
+        sExp = synth(120, 30, 0.9f, 0.85f, 4, 0);
+        sMine = synth(400, 200, 0.12f, 0.2f, 8, 0);
+        sPick = synth(500, 1200, 0.18f, 0, 5, 0);
+        sEng = engineLoop();
+    }
+    rlDisableBackfaceCulling();
+    SetRandomSeed(7);
+    remove("ironroad.log");
+    newGame();
+    hasSave = loadGame();
+    const char *at = getenv("RACE_AUTOTEST");
+    bool autotest = at != NULL;
+    if (autotest) {
+        raceIdx = atoi(at) > 0 ? atoi(at) - 1 : 0;
+        if (getenv("RACE_UPG")) { pu = getenv("RACE_UPG")[0] == '2' ? (Upg){1, 1, 1, 1, 1, 1, 1} : (Upg){5, 3, 3, 4, 3, 3, 3}; money = 99999; }
+    }
+    loadTrack(raceIdx);
+    newRace();
+    Camera3D cam = {0};
+    cam.up = (Vector3){0, 1, 0}; cam.fovy = 70; cam.projection = CAMERA_PERSPECTIVE;
+    float camH = 0;
+    bool paused = false;
+    int frames = 0, sel = 0;
+    bool storeShot = getenv("RACE_STORE") != NULL;
+    bool autoplay = getenv("RACE_AUTOPLAY") != NULL;  // test harness: self-driving player, 1 lap
+    if (autoplay) { LAPS = 1; if (getenv("RACE_AUTOPLAY")[0] != '3') { state = ST_COUNT; stateT = 0; } }
+    if (autotest && storeShot) {
+        enterStore();
+        if (getenv("RACE_DENT")) {  // visual test: batter the preview car
+            Car *c = &cars[0]; c->p = (Vector2){0, 0}; c->h = 0;
+            dent(c, (Vector2){0, 5}, 40); dent(c, (Vector2){3, 3}, 30); dent(c, (Vector2){-3, 1}, 35);
+            for (int i = 0; i < 6; i++) dent(c, (Vector2){3, -1 + i * 0.3f}, 10);
+            dent(c, (Vector2){-1, -5}, 45); c->hp = c->maxhp * 0.4f;
+        }
+    }
+    else if (autotest) { state = ST_COUNT; stateT = 0; }
+
+    while (!WindowShouldClose()) {
+        if (GetFrameTime() > 0.3f) logf_("HITCH: frame took %.2fs in state %d", GetFrameTime(), (int)state);
+        if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) || IsKeyPressed(KEY_SPACE)) logf_("key enter/space pressed in state %d (stateT=%.2f)", (int)state, stateT);
+        float dt = fminf(GetFrameTime(), 1 / 30.0f);
+        { static int prevState = -1, stores = 0;
+          if ((int)state != prevState) {
+              logf_("state %d -> %d  raceIdx=%d money=%d", prevState, (int)state, raceIdx, money);
+              if (autoplay) fprintf(stderr, "STATE %d -> %d (raceIdx=%d money=%d)\n", prevState, (int)state, raceIdx, money);
+              if (state == ST_STORE) stores++;
+              prevState = (int)state;
+          }
+          if (autoplay && stores >= 3 && state == ST_STORE && stateT > 3) { TakeScreenshot("shot.png"); fprintf(stderr, "AUTOPLAY: 3rd garage reached\n"); break; } }
+        if (autoplay && getenv("RACE_AUTOPLAY")[0] != '3' && state == ST_STORE && stateT > 2) { TakeScreenshot("shot.png"); fprintf(stderr, "AUTOPLAY: reached store ok\n"); break; }
+        if (autotest && !autoplay && ++frames > 300) { TakeScreenshot("shot.png"); if (frames > 305) break; }
+        if (IsKeyPressed(KEY_ESCAPE)) {
+            if (state == ST_MENU) break;
+            state = ST_MENU; loadTrack(raceIdx); newRace(); paused = false;
+        }
+        if (IsKeyPressed(KEY_P) && (state == ST_RACE)) paused = !paused;
+        stateT += dt;
+        if (state == ST_MENU) {
+            if (IsKeyPressed(KEY_N)) { newGame(); loadTrack(0); newRace(); }
+            if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) || IsKeyPressed(KEY_SPACE)) enterStore();
+        } else if (state == ST_STORE) {
+            if (IsKeyPressed(KEY_DOWN) || IsKeyPressed(KEY_S)) sel = (sel + 1) % NITEMS;
+            if (IsKeyPressed(KEY_UP) || IsKeyPressed(KEY_W)) sel = (sel + NITEMS - 1) % NITEMS;
+            if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
+                int *lv = itemLvl(sel);
+                if (*lv < items[sel].max && money >= itemPrice(sel)) {
+                    money -= itemPrice(sel); (*lv)++;
+                    snd(sPick, 0.7f, 1.0f);
+                    initCar(0); saveGame();
+                } else snd(sMine, 0.5f, 0.5f);
+            }
+            if (IsKeyPressed(KEY_SPACE)) { saveGame(); newRace(); state = ST_COUNT; stateT = 0; }
+        } else if (state == ST_COUNT && stateT > 3.5f) { state = ST_RACE; stateT = 0; }
+        else if (state == ST_DONE && stateT > 0.6f && (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) || IsKeyPressed(KEY_SPACE) || (autoplay && getenv("RACE_AUTOPLAY")[0] == '1' && stateT > 2))) {
+            fprintf(stderr, "DONE->next (raceIdx=%d)\n", raceIdx);
+            if (raceIdx >= NRACES) { state = ST_END; stateT = 0; }
+            else enterStore();
+        } else if (state == ST_END && (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) || IsKeyPressed(KEY_SPACE))) {
+            newGame(); loadTrack(0); newRace(); state = ST_MENU;
+        }
+
+        if ((state == ST_COUNT || state == ST_RACE || state == ST_DONE) && !paused) {
+            Ctl kc[MAXCARS];
+            memset(kc, 0, sizeof(kc));
+            bool go = state == ST_RACE || state == ST_DONE;
+            if (go) {
+                Ctl *k = &kc[0];
+                k->thr = (IsKeyDown(KEY_W) || IsKeyDown(KEY_UP)) - (IsKeyDown(KEY_S) || IsKeyDown(KEY_DOWN));
+                k->steer = (IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT)) - (IsKeyDown(KEY_A) || IsKeyDown(KEY_LEFT));
+                k->hb = IsKeyDown(KEY_SPACE);
+                k->fire[W_GUN] = IsKeyDown(KEY_F) || IsKeyDown(KEY_LEFT_CONTROL) || IsMouseButtonDown(MOUSE_LEFT_BUTTON);
+                k->fire[W_MISSILE] = IsKeyDown(KEY_G);
+                k->fire[W_LASER] = IsKeyDown(KEY_H);
+                k->fire[W_MINE] = IsKeyDown(KEY_B);
+                k->fire[W_CALT] = IsKeyDown(KEY_V);
+                if (autotest) { k->thr = 1; k->fire[W_GUN] = true; k->steer = 0; }
+                if (IsKeyPressed(KEY_R) && cars[0].alive) { cars[0].hp -= 15; respawnCar(&cars[0]); cars[0].hp = fmaxf(cars[0].hp, 1); }
+            }
+            for (int i = autoplay ? 0 : 1; i < MAXCARS; i++) if (go) aiControl(&cars[i], i, &kc[i], dt);
+            if (state == ST_DONE) memset(&kc[0], 0, sizeof kc[0]);  // results screen: no driving/firing input
+            for (int i = 0; i < MAXCARS; i++) updateCar(&cars[i], i, &kc[i], dt);
+            updateWorld(dt);
+            if (state == ST_RACE) {
+                raceT += dt;
+                if (cars[0].finished) {
+                    state = ST_DONE; stateT = 0;
+                    lastRank = rankOf(0);
+                    lastPay = payout[lastRank - 1] + cars[0].kills * 250;
+                    money += lastPay; score += placePts[lastRank - 1];
+                    raceIdx++;
+                    saveGame();
+                }
+            }
+            shake = fmaxf(0, shake - dt * 1.5f);
+        }
+
+        // engine sound
+        bool driving = state == ST_COUNT || state == ST_RACE || state == ST_DONE;
+        if (audioOK && driving && cars[0].alive) {
+            float sp = Vector2Length(cars[0].v);
+            SetSoundPitch(sEng, 0.7f + sp / MAXV * 1.6f);
+            SetSoundVolume(sEng, 0.25f);
+            if (!IsSoundPlaying(sEng)) PlaySound(sEng);
+        } else if (audioOK && IsSoundPlaying(sEng)) StopSound(sEng);
+
+        // camera
+        Car *pl = &cars[0];
+        if (state == ST_MENU || state == ST_END) {
+            float a = GetTime() * 0.15f;
+            Vector2 ctr = {0, 0};
+            for (int i = 0; i < NSEG; i += 8) ctr = Vector2Add(ctr, trk[i].p);
+            ctr = Vector2Scale(ctr, 8.0f / NSEG);
+            cam.position = (Vector3){ctr.x + sinf(a) * 420, 230, ctr.y + cosf(a) * 420};
+            cam.target = (Vector3){ctr.x, 0, ctr.y};
+            cam.fovy = 60;
+        } else if (state == ST_STORE) {
+            cam.position = (Vector3){2, 3.2f, 9.5f};
+            cam.target = (Vector3){-2.2f, 1.0f, 0};
+            cam.fovy = 45;
+        } else {
+            camH += angDiff(camH, pl->h) * fminf(1, 5 * dt);
+            Vector2 cf = fwdOf(camH);
+            float sp = Vector2Length(pl->v);
+            float back = 12 + sp * 0.06f;
+            cam.position = (Vector3){pl->p.x - cf.x * back, 5.2f, pl->p.y - cf.y * back};
+            cam.target = (Vector3){pl->p.x + cf.x * 8, 1.2f, pl->p.y + cf.y * 8};
+            cam.fovy = 68 + sp / MAXV * 14;
+            if (shake > 0) {
+                cam.position.x += rf(-1, 1) * shake; cam.position.y += rf(-1, 1) * shake * 0.6f; cam.position.z += rf(-1, 1) * shake;
+            }
+        }
+
+        BeginDrawing();
+        int W = GetScreenWidth(), H = GetScreenHeight();
+        const TrackDef *T = TDEF;
+        ClearBackground(T->skyBot);
+        DrawRectangleGradientV(0, 0, W, H * 0.55f, T->skyTop, T->skyBot);
+        if (state == ST_STORE) {
+            DrawRectangleGradientV(0, 0, W, H, (Color){25, 25, 35, 255}, (Color){60, 45, 40, 255});
+            drawStoreScene(cam);
+            drawStoreUI(sel);
+        } else drawWorld(cam);
+        if (state == ST_MENU) {
+            DrawRectangle(0, 0, W, H, (Color){0, 0, 0, 120});
+            drawCenter("IRON ROAD", 70, 100, ORANGE);
+            drawCenter("combat racing  -  10 tracks  -  upgrade your ride", 175, 28, LIGHTGRAY);
+            drawCenter("W/S or UP/DOWN  throttle / brake      A/D or LEFT/RIGHT  steer      SPACE  handbrake", 270, 22, WHITE);
+            drawCenter("F / Ctrl / Left-click  machine gun      G  homing missile      H  laser", 305, 22, WHITE);
+            drawCenter("B  drop mine      V  drop caltrops      R  reset onto track      P  pause", 340, 22, WHITE);
+            drawCenter("Win races to earn cash. Spend it in the garage. Survive all 10.", 400, 22, YELLOW);
+            if ((int)(GetTime() * 2) & 1)
+                drawCenter(hasSave ? TextFormat("ENTER - CONTINUE  (race %d/%d, $%d)", raceIdx + 1, NRACES, money) : "ENTER - NEW CAMPAIGN", 480, 34, WHITE);
+            drawCenter("N - new game", 540, 22, LIGHTGRAY);
+        } else if (state == ST_END) {
+            DrawRectangle(0, 0, W, H, (Color){0, 0, 0, 150});
+            drawCenter("CAMPAIGN COMPLETE", 150, 80, GOLD);
+            drawCenter(TextFormat("Championship points: %d / %d", score, NRACES * 10), 280, 36, WHITE);
+            drawCenter(score >= 80 ? "ROAD LEGEND" : score >= 55 ? "SEASONED KILLER" : score >= 30 ? "ROOKIE WRECKER" : "SCRAPYARD MATERIAL", 340, 40, ORANGE);
+            drawCenter("ENTER - back to menu", 450, 26, LIGHTGRAY);
+        } else if (state != ST_STORE) {
+            drawHUD(cam);
+            if (state == ST_COUNT) {
+                int n = 3 - (int)stateT;
+                drawCenter(n > 0 ? TextFormat("%d", n) : "GO!", H / 3, 140, n > 0 ? YELLOW : GREEN);
+                drawCenter(TextFormat("RACE %d/%d - %s", raceIdx + 1, NRACES, T->name), H / 3 - 90, 40, WHITE);
+                drawCenter(T->place, H / 3 - 50, 24, LIGHTGRAY);
+            }
+            if (paused) drawCenter("PAUSED", H / 3, 80, WHITE);
+            if (state == ST_DONE) {
+                DrawRectangle(W / 2 - 280, H / 2 - 220, 560, 440, (Color){0, 0, 0, 210});
+                drawCenter(lastRank == 1 ? "VICTORY!" : TextFormat("FINISHED  P%d", lastRank), H / 2 - 205, 60, lastRank == 1 ? GOLD : WHITE);
+                int order[MAXCARS];
+                for (int i = 0; i < MAXCARS; i++) order[i] = i;
+                for (int i = 0; i < MAXCARS; i++) for (int j = i + 1; j < MAXCARS; j++)
+                    if (rankOf(order[j]) < rankOf(order[i])) { int t = order[i]; order[i] = order[j]; order[j] = t; }
+                for (int i = 0; i < MAXCARS; i++) {
+                    Car *c = &cars[order[i]];
+                    DrawText(TextFormat("%d. %-8s kills %d", i + 1, c->name, c->kills), W / 2 - 150, H / 2 - 130 + i * 32, 24, c->col);
+                }
+                drawCenter(TextFormat("Prize + kills: $%d", lastPay), H / 2 + 80, 28, GREEN);
+                drawCenter(TextFormat("Points: %d   Cash: $%d", score, money), H / 2 + 115, 22, WHITE);
+                drawCenter(raceIdx >= NRACES ? "ENTER / SPACE - finish campaign" : "ENTER / SPACE - garage", H / 2 + 165, 24, LIGHTGRAY);
+            }
+        }
+        DrawFPS(W / 2 - 30, H - 24);
+        EndDrawing();
+    }
+    CloseWindow();
+    return 0;
+}
