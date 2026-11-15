@@ -1,6 +1,13 @@
 # IRON ROAD
 Death Track style 3D combat racer. C + raylib 5.5. Linux and Windows.
 
+![Title screen](screenshots/title.png)
+![Car select](screenshots/carselect.png)
+
+| Brawler | Hornet | Crusher |
+|---|---|---|
+| ![Brawler](screenshots/race-brawler.png) | ![Hornet](screenshots/race-hornet.png) | ![Crusher](screenshots/race-crusher.png) |
+
 ## Build
 **CMake (Linux, Windows/Visual Studio, MSYS2):**
 ```
@@ -52,3 +59,6 @@ W/S throttle/brake, A/D steer, Space handbrake, F/Ctrl/LMB gun, G homing missile
 H laser, B mine, V caltrops, R reset, P pause, Esc menu/quit.
 Garage: Up/Down select, Enter buy; start the race with the START RACE row (Enter) or R. Space does nothing there.
 Car select: Up/Down car, Left/Right color, Enter confirm.
+
+## License
+MIT, see [LICENSE](LICENSE). raylib is zlib-licensed and is downloaded/built separately.

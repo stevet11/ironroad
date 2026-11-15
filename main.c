@@ -2041,7 +2041,7 @@ int main(void) {
                 drawCenter(raceIdx >= NRACES ? "ENTER / SPACE - finish campaign" : "ENTER / SPACE - garage", H / 2 + 165, 24, LIGHTGRAY);
             }
         }
-        DrawFPS(W / 2 - 30, H - 24);
+        if (!getenv("RACE_NOFPS")) DrawFPS(W / 2 - 30, H - 24);
         EndDrawing();
     }
     CloseWindow();
