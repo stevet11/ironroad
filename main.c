@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <string.h>
 
 #define NSEG 800
@@ -30,6 +31,7 @@ static float trkLen;
 static float trkY[NSEG];      // road elevation (flyovers)
 static Vector2 crossP;        // centre of the flyover crossing
 static bool hasBridge;
+static int bridgeLo = -1, bridgeHi = -1;   // track indices of the lower and upper pass at the flyover
 static float baseY;           // elevation added to particles spawned this frame
 static bool classic;          // game mode: false = arcade, true = classic ("death track")
 static int mode;
@@ -51,7 +53,7 @@ typedef struct {
     int ammo[NW];
     float cd[NW];
     int lap, idx, kills, lastAttacker, place;
-    float prog, respawn, invuln, flat, stuck, finishTime, aiT, maxhp, y, accel, gripN, steerK, accFall;
+    float prog, respawn, invuln, flat, stuck, finishTime, aiT, maxhp, y, accel, gripN, steerK, accFall, battery, evadeT, prevSteerIn, prevThr;
     bool ai, alive, finished, meshDirty;
     Upg u;
     Dent dents[NDENT]; int ndent;
@@ -61,7 +63,7 @@ typedef struct {
 } Car;
 static Car cars[MAXCARS];
 
-typedef struct { bool on; int type; Vector2 p; float y; Vector2 v; int owner; float life; int target; float dmg; } Proj;
+typedef struct { bool on; int type; Vector2 p; float y; Vector2 v; int owner; float life; int target; float dmg; float lockT; bool aiRolled; } Proj;
 static Proj proj[256];
 typedef struct { bool on; Vector2 p; int owner; float arm, life, y; } Mine;
 static Mine mines[64];
@@ -85,7 +87,7 @@ static char msgs[5][64];
 static float msgT[5];
 
 // ---------------------------------------------------------------- audio
-static Sound sGun, sMis, sLas, sExp, sMine, sPick, sEng;
+static Sound sGun, sMis, sLas, sExp, sMine, sPick, sEng, sBeep, sBeepMine, sBeepCalt;
 static bool audioOK;
 static Sound synth(float f0, float f1, float dur, float noise, float decay, int saw) {
     int n = (int)(22050 * dur);
@@ -227,7 +229,7 @@ static void buildBridge(void) {
         if (d < bd) { bd = d; bi = i; bj = j; }
     }
     if (bi < 0 || sqrtf(bd) > HALF * 1.6f) return;
-    hasBridge = true;
+    hasBridge = true; bridgeLo = bi; bridgeHi = bj;
     crossP = Vector2Scale(Vector2Add(trk[bi].p, trk[bj].p), 0.5f);
     if (getenv("RACE_DEBUG")) fprintf(stderr, "bridge: crossing idx %d/%d\n", bi, bj);
     float W = 230.0f / seg;
@@ -293,7 +295,10 @@ static float deadT;
 static Upg pu;  // player's purchased upgrades
 static float pHp = -1;            // classic: carried-over armor (<0 = full)
 static int pAmmo[NW];             // classic: carried-over consumables
-static bool trackWon[NRACES];     // classic: tracks where the player has won (start at the front)
+static int champ[MAXCARS];        // championship points of the AI drivers (the player's are in `score`)
+static bool warnMissile, warnMine, warnCalt;   // proximity / lock warnings for the player this frame
+static float warnMissileDist, warnMineDist, warnCaltDist;
+static int gridSlot(int i);
 static void dent(Car *c, Vector2 src, float strength);
 static void explode(Vector2 p, float radius, float dmg, int owner, bool big);
 void damageCar(Car *c, float d, int owner);
@@ -310,6 +315,14 @@ static float cdOf(Car *c, int w) {
     return wcd[w] * m;
 }
 
+static float battCap(Car *c) { return 10.0f * (1 + 0.5f * c->u.ammo); }
+static int gridSlot(int i) {   // classic: starting grid follows the championship standings
+    if (!classic) return i;
+    #define GKEY(x) ((x) == 0 ? score : champ[x]) * 10 + ((x) == 0 ? 0 : 6 - (x))
+    int rank = 0, ki = GKEY(i);
+    for (int j = 0; j < MAXCARS; j++) if (j != i && GKEY(j) > ki) rank++;
+    return rank;
+}
 static void respawnCar(Car *c) {
     TP *t = &trk[c->idx];
     c->p = Vector2Add(t->p, Vector2Scale(t->r, c->lane * 0.5f));
@@ -336,7 +349,7 @@ static void initCar(int i) {
             c->steerK = 1.5f + 0.1f * pu.tires;
         }
     } else {
-        c->maxv = classic ? 38.0f + r * 1.9f + rf(0, 4.5f) : 40.0f + r * 0.9f + rf(0, 7);
+        c->maxv = classic ? 37.0f + r * 1.9f + rf(0, 8.0f) : 40.0f + r * 0.9f + rf(0, 7);
         c->u = (Upg){r / 2 + (r > 0 ? GetRandomValue(0, 1) : 0), (r + GetRandomValue(0, 3)) / 4, (r + GetRandomValue(0, 3)) / 4,
                      (r + GetRandomValue(0, 2)) / 3, r / 4, r / 4, r / 3};
         if (c->u.armor > 5) c->u.armor = 5;
@@ -344,8 +357,7 @@ static void initCar(int i) {
     }
     c->maxhp = 100 + 30 * c->u.armor;
     // grid slot: in classic mode you start at the very back until you have won on this track
-    int slot = i;
-    if (classic && !trackWon[curTrack]) slot = i == 0 ? MAXCARS - 1 : i - 1;
+    int slot = gridSlot(i);
     c->lane = (slot % 2 ? 1 : -1) * 5.0f;
     c->idx = NSEG - 6 - (slot / 2) * 6;
     c->lap = 0; c->hp = c->maxhp;
@@ -356,6 +368,7 @@ static void initCar(int i) {
         if (pHp >= 0) c->hp = fminf(pHp, c->maxhp);
     }
     c->lastAttacker = -1;
+    c->battery = battCap(c);   // classic: lasers run off a rechargeable battery
     respawnCar(c); c->invuln = 0;
     if (classic && i == 0 && c->hp < c->maxhp) {  // show the accumulated damage as dents
         int nd = (int)((1 - c->hp / c->maxhp) * 14);
@@ -487,6 +500,7 @@ void damageCar(Car *c, float d, int owner) {
 static void fireWeapon(Car *c, int ci, int w) {
     if (!c->alive || c->cd[w] > 0 || c->ammo[w] <= 0) return;
     c->cd[w] = cdOf(c, w); c->ammo[w]--;
+    if (classic && w == W_LASER) c->battery -= 1;
     baseY = c->y;
     Vector2 f = fwdOf(c->h);
     Vector2 r = {-f.y, f.x};
@@ -515,7 +529,7 @@ static void fireWeapon(Car *c, int ci, int w) {
                 p->dmg = misDmg(c);
                 float best = 1e9f;
                 for (int k = 0; k < MAXCARS; k++) {
-                    if (k == ci || !cars[k].alive) continue;
+                    if (k == ci || !cars[k].alive || (classic && c->ai && k != 0)) continue;   // classic: AI missiles lock only onto you
                     Vector2 rel = Vector2Subtract(cars[k].p, c->p);
                     float d = Vector2Length(rel);
                     if (d < 200 && Vector2DotProduct(Vector2Normalize(rel), f) > 0.8f && d < best) { best = d; p->target = k; }
@@ -566,6 +580,15 @@ static void updateCar(Car *c, int ci, Ctl *k, float dt) {
         return;
     }
     baseY = c->y;
+    if (classic) {   // laser battery recharges slowly; show the charge as the laser "ammo"
+        c->battery = fminf(battCap(c), c->battery + dt / (7.0f - 1.0f * c->u.laser));
+        c->ammo[W_LASER] = (int)c->battery;
+    }
+    {   // a quick swerve or hard stab of the brakes is an evasive manoeuvre (breaks missile locks)
+        bool ev = (fabsf(k->steer - c->prevSteerIn) > 0.9f && fabsf(k->steer) > 0.5f) || (k->thr < -0.5f && c->prevThr >= -0.5f);
+        if (ev) c->evadeT = 0.6f; else c->evadeT -= dt;
+        c->prevSteerIn = k->steer; c->prevThr = k->thr;
+    }
     c->invuln -= dt; c->flat -= dt;
     for (int w = 0; w < NW; w++) c->cd[w] -= dt;
     Vector2 f = fwdOf(c->h);
@@ -682,7 +705,7 @@ static void aiControl(Car *c, int ci, Ctl *k, float dt) {
     c->aiT = 0.05f;
     Vector2 r = {-f.y, f.x};
     for (int o = 0; o < MAXCARS; o++) {
-        if (o == ci || !cars[o].alive || fabsf(cars[o].y - c->y) > 3) continue;
+        if (o == ci || !cars[o].alive || fabsf(cars[o].y - c->y) > 3 || (classic && o != 0)) continue;   // classic: AI cars fight only you
         Vector2 rel = Vector2Subtract(cars[o].p, c->p);
         float dist = Vector2Length(rel), along = Vector2DotProduct(rel, f), lat = fabsf(Vector2DotProduct(rel, r));
         if (along > 0) {
@@ -698,6 +721,7 @@ static void aiControl(Car *c, int ci, Ctl *k, float dt) {
 
 // ---------------------------------------------------------------- world update
 static void updateWorld(float dt) {
+    warnMissile = false; warnMissileDist = 1e9f;
     // car-car collisions
     for (int i = 0; i < MAXCARS; i++) for (int j = i + 1; j < MAXCARS; j++) {
         Car *a = &cars[i], *b = &cars[j];
@@ -741,6 +765,25 @@ static void updateWorld(float dt) {
         if (!p->on) continue;
         p->life -= dt;
         baseY = p->y - 0.9f;
+        if (p->type == 1) p->lockT += dt;
+        if (p->type == 1 && p->target >= 0 && cars[p->target].alive) {
+            Car *tc = &cars[p->target];
+            float dd = Vector2Distance(p->p, tc->p);
+            if (p->target == 0) { warnMissile = true; warnMissileDist = fminf(warnMissileDist, dd); }
+            if (tc->ai && !p->aiRolled && p->lockT > 0.5f) {   // AI drivers try to dodge too
+                p->aiRolled = true;
+                if (GetRandomValue(0, 99) < (classic ? 35 + 3 * raceIdx : 30)) {
+                    tc->evadeT = 0.6f;
+                    Vector2 rr = {-fwdOf(tc->h).y, fwdOf(tc->h).x};
+                    tc->v = Vector2Add(tc->v, Vector2Scale(rr, GetRandomValue(0, 1) ? 7.0f : -7.0f));
+                }
+            }
+            if (tc->evadeT > 0 && p->lockT > 0.25f && dd > 9) {   // evaded: the missile loses its lock
+                if (p->target == 0) addMsg("MISSILE EVADED!");
+                else if (p->owner == 0) addMsg("%s dodged your missile", tc->name);
+                p->target = -1;
+            }
+        }
         if (p->type == 1) {  // missile homing
             if (p->target >= 0 && cars[p->target].alive) {
                 Vector2 want = Vector2Normalize(Vector2Subtract(cars[p->target].p, p->p));
@@ -799,6 +842,24 @@ static void updateWorld(float dt) {
         if (q->p.y < 0.1f) { q->p.y = 0.1f; q->v.y *= -0.3f; q->v.x *= 0.7f; q->v.z *= 0.7f; }
     }
     for (int i = 0; i < 5; i++) msgT[i] -= dt;
+    // beep warnings for mines / caltrops ahead of the player
+    warnMine = warnCalt = false; warnMineDist = warnCaltDist = 1e9f;
+    Car *pl = &cars[0];
+    if (pl->alive) {
+        Vector2 f = fwdOf(pl->h), r = {-f.y, f.x};
+        for (int i = 0; i < 64; i++) {
+            if (mines[i].on && fabsf(mines[i].y - pl->y) < 3) {
+                Vector2 rel = Vector2Subtract(mines[i].p, pl->p);
+                float along = Vector2DotProduct(rel, f), lat = fabsf(Vector2DotProduct(rel, r));
+                if (along > 2 && along < 55 && lat < 9) { warnMine = true; warnMineDist = fminf(warnMineDist, along); }
+            }
+            if (calts[i].on && fabsf(calts[i].y - pl->y) < 3) {
+                Vector2 rel = Vector2Subtract(calts[i].p, pl->p);
+                float along = Vector2DotProduct(rel, f), lat = fabsf(Vector2DotProduct(rel, r));
+                if (along > 2 && along < 55 && lat < 9) { warnCalt = true; warnCaltDist = fminf(warnCaltDist, along); }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------- rendering
@@ -821,7 +882,7 @@ static void drawTrack(void) {
         if (i % 8 < 4) {
             Vector2 al = Vector2Subtract(a->p, Vector2Scale(a->r, 0.25f)), ar = Vector2Add(a->p, Vector2Scale(a->r, 0.25f));
             Vector2 bl = Vector2Subtract(b->p, Vector2Scale(b->r, 0.25f)), br = Vector2Add(b->p, Vector2Scale(b->r, 0.25f));
-            quad(P3(al, i, 0.04f), P3(bl, n, 0.04f), P3(br, n, 0.04f), P3(ar, i, 0.04f), (Color){220, 200, 60, 255});
+            quad(P3(al, i, 0.09f), P3(bl, n, 0.09f), P3(br, n, 0.09f), P3(ar, i, 0.09f), (Color){220, 200, 60, 255});
         }
         Color wc = (i / 4) % 2 ? TDEF->wallA : TDEF->wallB;
         Vector2 aLo = Vector2Subtract(a->p, Vector2Scale(a->r, HALF + 1.2f)), bLo = Vector2Subtract(b->p, Vector2Scale(b->r, HALF + 1.2f));
@@ -845,7 +906,7 @@ static void drawTrack(void) {
     // start / finish line
     for (int k = 0; k < 10; k++) for (int j = 0; j < 2; j++) {
         Vector2 c0 = Vector2Add(trk[0].p, Vector2Add(Vector2Scale(trk[0].r, -HALF + 1.5f * k + 0.75f), Vector2Scale(trk[0].t, j * 1.5f)));
-        DrawCube((Vector3){c0.x, trkY[0] + 0.06f, c0.y}, 1.5f, 0.05f, 1.5f, (k + j) % 2 ? WHITE : BLACK);
+        DrawCube((Vector3){c0.x, trkY[0] + 0.1f, c0.y}, 1.5f, 0.06f, 1.5f, (k + j) % 2 ? WHITE : BLACK);
     }
 }
 
@@ -1017,7 +1078,7 @@ static void drawCar(Car *c, int ci) {
 
 static void drawWorld(Camera3D cam) {
     BeginMode3D(cam);
-    DrawPlane((Vector3){0, -0.05f, 0}, (Vector2){3000, 3000}, TDEF->ground);
+    DrawPlane((Vector3){0, -0.3f, 0}, (Vector2){3000, 3000}, TDEF->ground);
     for (int i = 0; i < 220; i++) {
         Deco *d = &deco[i];
         switch (d->type) {
@@ -1106,8 +1167,9 @@ static int rankOf(int ci) {
     int r = 1;
     for (int i = 0; i < MAXCARS; i++) {
         if (i == ci) continue;
-        float a = cars[i].finished ? 1e9f - cars[i].finishTime : (cars[i].alive ? cars[i].prog : cars[i].prog - 1e8f);
-        float b = cars[ci].finished ? 1e9f - cars[ci].finishTime : (cars[ci].alive ? cars[ci].prog : cars[ci].prog - 1e8f);
+        // finished cars rank by finish time (1e6 keeps float precision fine enough to tell finish times apart), then by progress; wrecks last
+        float a = cars[i].finished ? 1e6f - cars[i].finishTime : (cars[i].alive ? cars[i].prog : cars[i].prog - 1e5f);
+        float b = cars[ci].finished ? 1e6f - cars[ci].finishTime : (cars[ci].alive ? cars[ci].prog : cars[ci].prog - 1e5f);
         if (a > b) r++;
     }
     return r;
@@ -1120,7 +1182,7 @@ static void drawHUD(Camera3D cam) {
     for (int i = 1; i < MAXCARS; i++) {
         Car *c = &cars[i];
         if (!c->alive || Vector2Distance(c->p, pl->p) > 110) continue;
-        Vector3 wp = {c->p.x, 3.0f, c->p.y};
+        Vector3 wp = {c->p.x, c->y + 3.0f, c->p.y};
         if (Vector3DotProduct(Vector3Subtract(wp, cam.position), Vector3Subtract(cam.target, cam.position)) <= 0) continue;
         Vector2 sp = GetWorldToScreen(wp, cam);
         drawBar((int)sp.x - 25, (int)sp.y, 50, 5, c->hp / c->maxhp, c->col);
@@ -1136,8 +1198,12 @@ static void drawHUD(Camera3D cam) {
         bool ready = pl->ammo[w] > 0 && pl->cd[w] <= 0;
         DrawRectangle(x, H - 70, 110, 52, (Color){0, 0, 0, 160});
         DrawRectangleLines(x, H - 70, 110, 52, ready ? WHITE : GRAY);
-        DrawText(TextFormat("[%s] %s", wkey[w], wname[w]), x + 6, H - 64, 14, ready ? WHITE : GRAY);
+        DrawText(TextFormat("[%s] %s", wkey[w], (classic && w == W_LASER) ? "BATTERY" : wname[w]), x + 6, H - 64, 14, ready ? WHITE : GRAY);
         DrawText(TextFormat("%d", pl->ammo[w]), x + 6, H - 44, 24, pl->ammo[w] ? YELLOW : RED);
+        if (classic && w == W_LASER) {   // recharge bar
+            DrawRectangle(x + 40, H - 36, 62, 8, (Color){60, 60, 60, 255});
+            DrawRectangle(x + 40, H - 36, (int)(62 * Clamp(pl->battery / battCap(pl), 0, 1)), 8, SKYBLUE);
+        }
     }
     // speed / lap / pos
     int kmh = (int)(Vector2Length(pl->v) * 3.6f);
@@ -1151,6 +1217,18 @@ static void drawHUD(Camera3D cam) {
     if (Vector2DotProduct(pl->v, trk[pl->idx].t) < -6)
         DrawText("WRONG WAY", W / 2 - MeasureText("WRONG WAY", 50) / 2, 120, 50, RED);
     if (!pl->alive) DrawText("WRECKED", W / 2 - MeasureText("WRECKED", 60) / 2, H / 2 - 30, 60, RED);
+    {   // incoming-danger warnings
+        bool flash = ((int)(GetTime() * 6)) & 1;
+        int wy = 150;
+        if (warnMissile) {
+            const char *t1 = "!! MISSILE LOCK !!", *t2 = "SWERVE OR BRAKE!";
+            if (flash) DrawText(t1, W / 2 - MeasureText(t1, 44) / 2, wy, 44, RED);
+            DrawText(t2, W / 2 - MeasureText(t2, 24) / 2, wy + 48, 24, ORANGE);
+            wy += 84;
+        }
+        if (warnMine) { const char *t = "MINE AHEAD"; DrawText(t, W / 2 - MeasureText(t, 32) / 2, wy, 32, flash ? YELLOW : ORANGE); wy += 38; }
+        if (warnCalt) { const char *t = "CALTROPS AHEAD"; DrawText(t, W / 2 - MeasureText(t, 32) / 2, wy, 32, flash ? ORANGE : YELLOW); }
+    }
     for (int i = 0; i < 5; i++) if (msgT[i] > 0) DrawText(msgs[i], W / 2 - MeasureText(msgs[i], 22) / 2, 20 + i * 26, 22, Fade(WHITE, fminf(1, msgT[i])));
     // minimap
     float minx = 1e9f, maxx = -1e9f, minz = 1e9f, maxz = -1e9f;
@@ -1161,7 +1239,7 @@ static void drawHUD(Camera3D cam) {
     float sc = 170 / fmaxf(maxx - minx, maxz - minz);
     int mx = W - 200, my = 20;
     DrawRectangle(mx - 8, my - 8, 196, 196, (Color){0, 0, 0, 140});
-    #define MM(p) (Vector2){mx + ((p).x - minx) * sc, my + 170 - ((p).y - minz) * sc}
+    #define MM(p) (Vector2){mx + (maxx - (p).x) * sc, my + 170 - ((p).y - minz) * sc}   // +Z up; the right-hand side of the map is world -X (same as the driver's right)
     for (int i = 0; i < NSEG; i += 4) DrawLineV(MM(trk[i].p), MM(trk[(i + 4) % NSEG].p), GRAY);
     for (int i = 0; i < MAXCARS; i++) if (cars[i].alive) DrawCircleV(MM(cars[i].p), i == 0 ? 5 : 3.5f, cars[i].col);
 }
@@ -1182,7 +1260,7 @@ static void logf_(const char *fmt, ...) {
 enum { K_UPG, K_REPAIR, K_AMMO };
 typedef struct { const char *name, *desc; int kind, max, base, step, arg; } Item;
 #define NITEMS_ARCADE 7
-#define NITEMS_ALL 16
+#define NITEMS_ALL 15
 static const Item items[NITEMS_ALL] = {
     {"ARMOR PLATING", "+30 armor per level. Side plates soak the punishment.", K_UPG, 5, 500, 300, 0},
     {"FRONT SPIKES", "Spiked ram bumper. Head-on hits shred the other car.", K_UPG, 3, 400, 300, 0},
@@ -1198,7 +1276,6 @@ static const Item items[NITEMS_ALL] = {
     {"REPAIR", "Fix 20 armor points ($5 each). Damage carries over between races.", K_REPAIR, 0, 0, 0, 0},
     {"GUN AMMO +50", "Rounds are NOT refilled between races in classic mode.", K_AMMO, 0, 60, 0, W_GUN},
     {"MISSILE x1", "One homing missile.", K_AMMO, 0, 200, 0, W_MISSILE},
-    {"LASER CELL x1", "One laser shot.", K_AMMO, 0, 140, 0, W_LASER},
     {"MINE x1", "One mine.", K_AMMO, 0, 100, 0, W_MINE},
     {"CALTROPS x1", "One batch of tire-shredding spikes.", K_AMMO, 0, 80, 0, W_CALT},
 };
@@ -1243,19 +1320,22 @@ static bool buyItem(int i) {
 }
 
 #define SAVE_MAGIC 0x1A0AE
-typedef struct { int magic, raceIdx, money, score; Upg u; float hp; int ammo[NW]; unsigned char won[NRACES]; } Save;
+typedef struct { int magic, raceIdx, money, score; Upg u; float hp; int ammo[NW]; unsigned char won_unused[NRACES]; int champ[MAXCARS]; } Save;
+#define SAVE_V1_SIZE offsetof(Save, champ)   // older saves end before the championship table
 static const char *savePath(int m) { return m ? "ironroad_classic.sav" : "ironroad_arcade.sav"; }
 static bool readSave(int m, Save *sv) {
     FILE *f = fopen(savePath(m), "rb");
     if (!f) return false;
-    bool ok = fread(sv, sizeof *sv, 1, f) == 1 && sv->magic == SAVE_MAGIC && sv->raceIdx >= 0 && sv->raceIdx < NRACES;
+    memset(sv, 0, sizeof *sv);
+    size_t n = fread(sv, 1, sizeof *sv, f);
+    bool ok = n >= SAVE_V1_SIZE && sv->magic == SAVE_MAGIC && sv->raceIdx >= 0 && sv->raceIdx < NRACES;
     fclose(f);
     return ok;
 }
 static void saveGame(void) {
-    Save sv = {SAVE_MAGIC, raceIdx, money, score, pu, pHp, {0}, {0}};
+    Save sv = {SAVE_MAGIC, raceIdx, money, score, pu, pHp, {0}, {0}, {0}};
     for (int w = 0; w < NW; w++) sv.ammo[w] = pAmmo[w];
-    for (int t = 0; t < NRACES; t++) sv.won[t] = trackWon[t];
+    for (int w = 1; w < MAXCARS; w++) sv.champ[w] = champ[w];
     FILE *f = fopen(savePath(mode), "wb");
     if (f) { fwrite(&sv, sizeof sv, 1, f); fclose(f); }
 }
@@ -1264,11 +1344,11 @@ static bool loadGame(int m) {
     if (!readSave(m, &sv)) return false;
     raceIdx = sv.raceIdx; money = sv.money; score = sv.score; pu = sv.u; pHp = sv.hp;
     for (int w = 0; w < NW; w++) pAmmo[w] = sv.ammo[w];
-    for (int t = 0; t < NRACES; t++) trackWon[t] = sv.won[t];
+    for (int w = 1; w < MAXCARS; w++) champ[w] = sv.champ[w];
     return true;
 }
 static void resetProgress(void) {
-    raceIdx = 0; score = 0; memset(&pu, 0, sizeof pu); memset(trackWon, 0, sizeof trackWon);
+    raceIdx = 0; score = 0; memset(&pu, 0, sizeof pu); memset(champ, 0, sizeof champ);
     money = classic ? 1500 : 1000;
     pHp = -1;
     static const int startAmmo[NW] = {100, 2, 2, 1, 1};
@@ -1292,13 +1372,16 @@ static void finishRace(bool dead) {
         for (int w = 0; w < NW; w++) pAmmo[w] = cars[0].ammo[w];
         pHp = dead ? 0.25f * cars[0].maxhp : cars[0].hp;
         if (pHp >= cars[0].maxhp) pHp = -1;
-        if (!dead && lastRank == 1) trackWon[curTrack] = true;
         if (money < 600) { money = 600; bailout = true; }   // sponsor keeps you from being stuck broke
     }
-    if (!dead) { score += placePts[lastRank - 1]; raceIdx++; }
+    if (!dead) {
+        score += placePts[lastRank - 1];
+        for (int i = 1; i < MAXCARS; i++) champ[i] += placePts[rankOf(i) - 1];
+        raceIdx++;
+    }
     saveGame();
     logf_("race end: dead=%d rank=%d pay=%d money=%d pHp=%.0f raceIdx=%d", dead, lastRank, lastPay, money, pHp, raceIdx);
-    if (getenv("RACE_AUTOPLAY")) fprintf(stderr, "RACEEND dead=%d rank=%d pay=%d money=%d pHp=%.0f raceIdx=%d ammoGun=%d\n", dead, lastRank, lastPay, money, pHp, raceIdx, pAmmo[0]);
+    if (getenv("RACE_AUTOPLAY")) { int al = 0; for (int i = 1; i < MAXCARS; i++) al += cars[i].alive; fprintf(stderr, "RACEEND dead=%d rank=%d pay=%d money=%d pHp=%.0f raceIdx=%d ammoGun=%d aiAlive=%d gridP%d score=%d champ=%d,%d,%d,%d,%d\n", dead, lastRank, lastPay, money, pHp, raceIdx, pAmmo[0], al, gridSlot(0) + 1, score, champ[1], champ[2], champ[3], champ[4], champ[5]); }
 }
 
 static void enterStore(void) {
@@ -1318,7 +1401,7 @@ static void drawStoreScene(Camera3D cam) {
 }
 static void drawStoreUI(int sel) {
     int W = GetScreenWidth(), H = GetScreenHeight();
-    int n = nItems(), rowH = 52;
+    int n = nItems() + 1, rowH = 52;   // +1: START RACE row
     int vis = (H - 130 - 140) / rowH; if (vis > n) vis = n;
     static int top = 0;
     if (sel < top) top = sel;
@@ -1331,6 +1414,11 @@ static void drawStoreUI(int sel) {
     DrawText(TextFormat("Next: Race %d/%d  %s", raceIdx + 1, NRACES, tracksDef[raceIdx < NRACES ? raceIdx : NRACES - 1].name), 40, 86, 22, WHITE);
     for (int r = 0; r < vis; r++) {
         int i = top + r, y = 130 + r * rowH;
+        if (i == n - 1) {   // START RACE row
+            DrawRectangle(30, y - 4, 540, rowH - 4, i == sel ? (Color){60, 180, 60, 150} : (Color){30, 90, 30, 110});
+            DrawText(">>  START RACE", 44, y + 6, 28, i == sel ? WHITE : (Color){170, 230, 170, 255});
+            continue;
+        }
         const Item *it = &items[i];
         bool full = itemFull(i), can = !full && money >= itemPrice(i);
         if (i == sel) DrawRectangle(30, y - 4, 540, rowH - 4, (Color){255, 140, 0, 70});
@@ -1354,16 +1442,16 @@ static void drawStoreUI(int sel) {
         if (top + vis < n) DrawText("v more", 44, 130 + vis * rowH + 30, 18, LIGHTGRAY);
     }
     int dy = 130 + vis * rowH + 6;
-    DrawText(items[sel].desc, 40, dy, 18, YELLOW);
-    DrawText("UP/DOWN select    ENTER buy    SPACE start race    ESC menu", 40, H - 70, 18, LIGHTGRAY);
+    DrawText(sel == n - 1 ? "Select this row and press ENTER (or press R) when you are done shopping." : items[sel].desc, 40, dy, 18, YELLOW);
+    DrawText("UP/DOWN select    ENTER buy    R or the START RACE row to race    ESC menu", 40, H - 70, 18, LIGHTGRAY);
     const TrackDef *T = &tracksDef[raceIdx < NRACES ? raceIdx : NRACES - 1];
     DrawText(T->place, W - 20 - MeasureText(T->place, 22), 24, 22, LIGHTGRAY);
     DrawText(T->name, W - 20 - MeasureText(T->name, 40), 48, 40, WHITE);
     if (classic) {
         DrawText(TextFormat("Top speed %d km/h   Accel %.0f   Grip %.1f   Armor %d", (int)(cars[0].maxv * 3.6f), cars[0].accel, cars[0].gripN, (int)cars[0].maxhp),
                  W - 20 - 640, H - 40, 20, WHITE);
-        if (!trackWon[raceIdx < NRACES ? raceIdx : 0]) DrawText("No win here yet: you start at the BACK of the grid", W - 20 - 560, H - 70, 18, ORANGE);
-        else DrawText("Won here before: you start at the FRONT", W - 20 - 420, H - 70, 18, GREEN);
+        int gp = gridSlot(0) + 1;
+        DrawText(TextFormat("Championship points %d  -  you start P%d on the grid", score, gp), W - 20 - 620, H - 70, 18, gp == 1 ? GREEN : ORANGE);
     } else
         DrawText(TextFormat("Armor %d   Gun dmg %.1f   Missile %.0f   Laser %.0f", (int)cars[0].maxhp, gunDmg(&cars[0]), misDmg(&cars[0]), lasDmg(&cars[0])),
                  W - 20 - 560, H - 40, 20, WHITE);
@@ -1384,8 +1472,12 @@ int main(void) {
         sMine = synth(400, 200, 0.12f, 0.2f, 8, 0);
         sPick = synth(500, 1200, 0.18f, 0, 5, 0);
         sEng = engineLoop();
+        sBeep = synth(1250, 1250, 0.09f, 0, 6, 0);        // missile lock
+        sBeepMine = synth(480, 480, 0.13f, 0, 5, 0);       // mine ahead (low)
+        sBeepCalt = synth(1900, 1300, 0.07f, 0, 6, 0);     // caltrops ahead (chirp)
     }
     rlDisableBackfaceCulling();
+    rlSetClipPlanes(1.0, 3500.0);   // a tight near/far range keeps depth precision high (prevents road/ground z-fighting)
     SetRandomSeed(7);
     remove("ironroad.log");
     mode = 0; classic = false;
@@ -1419,7 +1511,11 @@ int main(void) {
             dent(c, (Vector2){-1, -5}, 45); c->hp = c->maxhp * 0.4f;
         }
     }
-    else if (autotest) { state = ST_COUNT; stateT = 0; }
+    else if (autotest && !getenv("RACE_MENU")) { state = ST_COUNT; stateT = 0; }
+    if (getenv("RACE_BRIDGE") && hasBridge) {   // test hook: player under the flyover, another car on top of it
+        cars[0].idx = (bridgeLo + NSEG - 10) % NSEG; respawnCar(&cars[0]); cars[0].invuln = 0; camH = cars[0].h;
+        cars[1].idx = bridgeHi; respawnCar(&cars[1]); cars[1].invuln = 0;
+    }
     if (getenv("RACE_TELEPORT")) { cars[0].idx = atoi(getenv("RACE_TELEPORT")) % NSEG; respawnCar(&cars[0]); cars[0].invuln = 0; camH = cars[0].h; }
 
     while (!WindowShouldClose()) {
@@ -1435,7 +1531,8 @@ int main(void) {
           }
           if (autoplay && stores >= 3 && state == ST_STORE && stateT > 3) { TakeScreenshot("shot.png"); fprintf(stderr, "AUTOPLAY: 3rd garage reached\n"); break; } }
         if (autoplay && getenv("RACE_AUTOPLAY")[0] != '3' && state == ST_STORE && stateT > 2) { TakeScreenshot("shot.png"); fprintf(stderr, "AUTOPLAY: reached store ok\n"); break; }
-        if (autotest && (!autoplay || getenv("RACE_SHOT")) && ++frames > (getenv("RACE_SHOT") ? atoi(getenv("RACE_SHOT")) : 300)) { TakeScreenshot("shot.png"); if (frames > 305) break; }
+        if (autotest && (!autoplay || getenv("RACE_SHOT")) && ++frames > (getenv("RACE_SHOT") ? atoi(getenv("RACE_SHOT")) : 300)) { if (frames == (getenv("RACE_SHOT") ? atoi(getenv("RACE_SHOT")) : 300) + 1) fprintf(stderr, "FPS at shot: %d\n", GetFPS()); TakeScreenshot("shot.png"); if (frames > 305) break; }
+        if (getenv("RACE_SHOTCOUNT") && state == ST_COUNT && stateT > 2.0f) { TakeScreenshot("shot.png"); break; }   // test hook: shoot the (frozen) countdown scene
         if (IsKeyPressed(KEY_ESCAPE)) {
             if (state == ST_MENU) break;
             state = ST_MENU; loadTrack(raceIdx); newRace(); paused = false;
@@ -1450,15 +1547,17 @@ int main(void) {
                 enterStore();
             }
         } else if (state == ST_STORE) {
-            int ni = nItems();
-            if (sel >= ni) sel = 0;
-            if (IsKeyPressed(KEY_DOWN) || IsKeyPressed(KEY_S)) sel = (sel + 1) % ni;
-            if (IsKeyPressed(KEY_UP) || IsKeyPressed(KEY_W)) sel = (sel + ni - 1) % ni;
+            int ni = nItems(), rows = ni + 1;   // last row is START RACE
+            if (sel >= rows) sel = 0;
+            if (IsKeyPressed(KEY_DOWN) || IsKeyPressed(KEY_S)) sel = (sel + 1) % rows;
+            if (IsKeyPressed(KEY_UP) || IsKeyPressed(KEY_W)) sel = (sel + rows - 1) % rows;
+            bool startRace = IsKeyPressed(KEY_R);
             if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
-                if (buyItem(sel)) { snd(sPick, 0.7f, 1.0f); initCar(0); saveGame(); }
+                if (sel == ni) startRace = true;
+                else if (buyItem(sel)) { snd(sPick, 0.7f, 1.0f); initCar(0); saveGame(); }
                 else snd(sMine, 0.5f, 0.5f);
             }
-            if (IsKeyPressed(KEY_SPACE)) { saveGame(); newRace(); state = ST_COUNT; stateT = 0; }
+            if (startRace) { saveGame(); newRace(); state = ST_COUNT; stateT = 0; }
         } else if (state == ST_COUNT && stateT > 3.5f) { state = ST_RACE; stateT = 0; }
         else if (state == ST_DONE && stateT > 0.6f && (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) || IsKeyPressed(KEY_SPACE) || (autoplay && getenv("RACE_AUTOPLAY")[0] == '1' && stateT > 2))) {
             fprintf(stderr, "DONE->next (raceIdx=%d)\n", raceIdx);
@@ -1489,6 +1588,13 @@ int main(void) {
             if (state == ST_DONE) memset(&kc[0], 0, sizeof kc[0]);  // results screen: no driving/firing input
             for (int i = 0; i < MAXCARS; i++) updateCar(&cars[i], i, &kc[i], dt);
             updateWorld(dt);
+            {   // warning beeps (missile lock, mine ahead, caltrops ahead) - faster as the danger gets closer
+                static float bt[3];
+                for (int b = 0; b < 3; b++) bt[b] -= dt;
+                if (warnMissile && bt[0] <= 0) { snd(sBeep, 0.8f, 1.0f); bt[0] = Clamp(warnMissileDist / 250, 0.1f, 0.5f); }
+                if (warnMine && bt[1] <= 0) { snd(sBeepMine, 0.7f, 1.0f); bt[1] = Clamp(warnMineDist / 110, 0.12f, 0.5f); }
+                if (warnCalt && bt[2] <= 0) { snd(sBeepCalt, 0.6f, 1.0f); bt[2] = Clamp(warnCaltDist / 110, 0.12f, 0.5f); }
+            }
             if (state == ST_RACE) {
                 raceT += dt;
                 if (classic) {
@@ -1500,6 +1606,20 @@ int main(void) {
                     if (!cars[0].alive) { deadT += dt; if (deadT > 2.5f) finishRace(true); }
                 }
                 if (getenv("RACE_KILL")) { static bool killed; if (!killed && raceT > 6) { killed = true; cars[0].invuln = 0; damageCar(&cars[0], 1e6f, 1); } }
+                if (getenv("RACE_MTEST")) {   // test hook: AI fires a missile at the player; a mine sits ahead; player "swerves" after 0.7s
+                    static int mt; static float mtT;
+                    if (mt == 0 && raceT > 4) {
+                        Vector2 f = fwdOf(cars[0].h);
+                        cars[1].idx = (cars[0].idx + NSEG - 14) % NSEG; cars[1].p = Vector2Subtract(cars[0].p, Vector2Scale(f, 50)); cars[1].h = cars[0].h; cars[1].v = cars[0].v;
+                        cars[1].y = cars[0].y; cars[1].cd[W_MISSILE] = 0;
+                        fireWeapon(&cars[1], 1, W_MISSILE);
+                        mines[0] = (Mine){true, Vector2Add(cars[0].p, Vector2Scale(f, 40)), 1, 0.8f, 40, cars[0].y};
+                        mt = 1; mtT = raceT; fprintf(stderr, "MTEST fired; lock target=%d\n", proj[0].target);
+                    }
+                    if (mt == 1) { fprintf(stderr, "MTEST t=%.2f warnMissile=%d dist=%.0f warnMine=%d\n", raceT - mtT, warnMissile, warnMissileDist, warnMine); }
+                    if (mt == 1 && raceT > mtT + 0.3f) { mt = 2; cars[0].prevSteerIn = 0; cars[0].evadeT = 0.6f; fprintf(stderr, "MTEST player swerves\n"); }
+                    if (mt == 2 && raceT > mtT + 1.5f) { fprintf(stderr, "MTEST after: warnMissile=%d lastmsg='%s' proj0 target=%d on=%d\n", warnMissile, msgs[0], proj[0].target, proj[0].on); mt = 3; }
+                }
                 if (state == ST_RACE && cars[0].finished) finishRace(false);
             }
             shake = fmaxf(0, shake - dt * 1.5f);
@@ -1561,7 +1681,7 @@ int main(void) {
             drawCenter("B  drop mine      V  drop caltrops      R  reset onto track      P  pause", 305, 20, WHITE);
             static const char *mname[2] = {"ARCADE", "CLASSIC"};
             static const char *mdesc[2] = {"Respawn after wrecks. Free ammo and repairs each race. Fast cars from the start.",
-                                           "No respawns, for anyone. Pay for repairs and ammo. Earn your speed. Start at the back."};
+                                           "No respawns, for anyone. Pay for repairs and ammo. Earn your speed and your grid spot."};
             for (int m = 0; m < 2; m++) {
                 Save sv; bool has = readSave(m, &sv);
                 int y = 370 + m * 110;
@@ -1586,7 +1706,7 @@ int main(void) {
                 drawCenter(n > 0 ? TextFormat("%d", n) : "GO!", H / 3, 140, n > 0 ? YELLOW : GREEN);
                 drawCenter(TextFormat("RACE %d/%d - %s", raceIdx + 1, NRACES, T->name), H / 3 - 90, 40, WHITE);
                 drawCenter(T->place, H / 3 - 50, 24, LIGHTGRAY);
-                if (classic) drawCenter(trackWon[curTrack] ? "CLASSIC - front of the grid" : "CLASSIC - you start at the back", H / 3 - 20, 20, ORANGE);
+                if (classic) drawCenter(TextFormat("CLASSIC - you start P%d (championship standing)", gridSlot(0) + 1), H / 3 - 20, 20, ORANGE);
             }
             if (paused) drawCenter("PAUSED", H / 3, 80, WHITE);
             if (state == ST_DONE) {
@@ -1599,7 +1719,7 @@ int main(void) {
                     if (rankOf(order[j]) < rankOf(order[i])) { int t = order[i]; order[i] = order[j]; order[j] = t; }
                 for (int i = 0; i < MAXCARS; i++) {
                     Car *c = &cars[order[i]];
-                    DrawText(TextFormat("%d. %-8s kills %d", i + 1, c->name, c->kills), W / 2 - 150, H / 2 - 130 + i * 32, 24, c->col);
+                    DrawText(classic ? TextFormat("%d. %-8s kills %d  pts %d", i + 1, c->name, c->kills, order[i] == 0 ? score : champ[order[i]]) : TextFormat("%d. %-8s kills %d", i + 1, c->name, c->kills), W / 2 - 190, H / 2 - 130 + i * 32, 24, c->col);
                 }
                 drawCenter(TextFormat(lostRace ? "Kill bounties: $%d" : "Prize + kills: $%d", lastPay), H / 2 + 80, 28, GREEN);
                 if (lostRace) drawCenter("Your wreck needs repairs - same track again", H / 2 + 50, 20, ORANGE);
